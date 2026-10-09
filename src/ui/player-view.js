@@ -301,7 +301,7 @@ export function createPlayerView({ store, actions }) {
   let offlineWait = false; // RECONNECTING because the device went offline (no attempts consumed)
   let autoplayBlocked = false; // PAUSED because the browser refused autoplay
   let autoMuted = false;
-  let volumeIntentAt = 0;
+  let volumeIntentAt = -Infinity; // not 0: performance.now() starts near 0 and would look like a fresh intent
   let lastVolume = 1;
   let controlsShown = true;
   let hideTimer = 0;
@@ -1921,6 +1921,7 @@ export function createPlayerView({ store, actions }) {
       video.muted = !!store.get().muted;
     }
     pendingLoad = true;
+    publishPlaybackState(S.LOADING); // don't leave the previous channel's state (e.g. 'error') in the store
     renderState();
     let result;
     try {
@@ -1957,6 +1958,7 @@ export function createPlayerView({ store, actions }) {
     } catch {
       /* ignore */
     }
+    publishPlaybackState(S.IDLE);
   }
 
   /** Explicitly play (true) or pause (false). */
@@ -2186,10 +2188,16 @@ export function createPlayerView({ store, actions }) {
   // Event wiring
   // ---------------------------------------------------------------------------------------------------------
 
+  /** Mirror the engine state into the store (`state.playbackState`, a PlayerState value) for other views. */
+  function publishPlaybackState(state) {
+    if (store.get().playbackState !== state) store.set({ playbackState: state });
+  }
+
   // Player events (SPEC §3.4 — CustomEvent with e.detail).
   onPlayer('statechange', (e) => {
     const state = e.detail?.state ?? player.state;
     const reason = e.detail?.reason;
+    publishPlaybackState(state);
     offlineWait = state === S.RECONNECTING && reason === 'offline';
     autoplayBlocked = state === S.PAUSED && reason === 'autoplay-blocked';
     if (state !== S.IDLE) pendingLoad = false;
@@ -2520,6 +2528,7 @@ export function createPlayerView({ store, actions }) {
   ];
 
   setMediaHandlers(true);
+  publishPlaybackState(player.state);
   renderVolume();
   renderFullscreen();
   setControlsShown(true);
@@ -2556,6 +2565,7 @@ export function createPlayerView({ store, actions }) {
     } catch {
       /* ignore */
     }
+    publishPlaybackState(S.IDLE);
     el.remove();
   }
 

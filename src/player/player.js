@@ -5,8 +5,8 @@
 // Every engine "run" gets a load token. All async continuations, engine callbacks and timers check it, so
 // rapid channel switching never leaks engines, timers or listeners, and never applies stale events.
 
-import Hls from 'hls.js';
-// hls.js' ESM build only transmuxes in a Web Worker when given a worker script URL (same origin, CSP-safe).
+// hls.js itself is loaded on demand (see loadHls()), so the app shell starts without it. The worker URL is a
+// plain asset URL: hls.js' ESM build only transmuxes in a Web Worker when given one (same origin, CSP-safe).
 import hlsWorkerUrl from 'hls.js/dist/hls.worker.js?url';
 import { formatBitrate, tryParseUrl } from '../lib/utils.js';
 import {
@@ -401,6 +401,41 @@ function trackLabel(name, lang, index) {
   return String(name || '').trim() || languageLabel(lang) || `Track ${index + 1}`;
 }
 
+/** The hls.js class once loadHls() resolved (engine code below only runs after that). */
+let Hls = null;
+let hlsImport = null;
+
+/**
+ * Load hls.js (a separate ~500 kB chunk) once; later calls reuse it. A failed import is retried on the next
+ * call. Call it early (e.g. once a playlist is shown) to warm the chunk up before the first HLS channel.
+ * @returns {Promise<typeof import('hls.js').default>}
+ */
+export function loadHls() {
+  if (Hls) return Promise.resolve(Hls);
+  hlsImport ||= import('hls.js').then(
+    (mod) => {
+      const Ctor = typeof mod?.default === 'function' ? mod.default : mod;
+      if (typeof Ctor?.isSupported !== 'function') throw new Error('hls.js module has no Hls export');
+      Hls = Ctor;
+      return Ctor;
+    },
+    (err) => {
+      hlsImport = null;
+      throw err;
+    },
+  );
+  return hlsImport;
+}
+
+/** Reject when `promise` hasn't settled after `ms` (the timer is always cleared). */
+function withTimeout(promise, ms, message) {
+  let timer = 0;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** mpegts.js is UMD/CJS: depending on the bundler the API is the module, its default, or default.default. */
 function resolveMpegts(mod) {
   for (const candidate of [mod?.default, mod, mod?.default?.default]) {
@@ -793,7 +828,9 @@ export class Player extends EventTarget {
       const raw = attempt(() => hls.levels, [])?.[idx];
       if (raw) {
         bitrate = raw.bitrate || 0;
-        level = levelLabel({ ...raw, index: idx });
+        // A plain media playlist has neither RESOLUTION nor BANDWIDTH: use the decoded height below instead
+        // of a meaningless "Level 1".
+        if ((raw.height | 0) > 0 || bitrate > 0) level = levelLabel({ ...raw, index: idx });
       }
       const estimate = attempt(() => hls.bandwidthEstimate, NaN);
       if (Number.isFinite(estimate)) bandwidth = estimate;
@@ -945,7 +982,29 @@ export class Player extends EventTarget {
     }
     session.engineType = type;
 
-    const chain = this.#buildChain(type);
+    // hls.js is only fetched for streams it might play. A failed load leaves the native player (if any).
+    let hlsOk = false;
+    let hlsError = null;
+    if (type === 'hls' || type === 'unknown') {
+      try {
+        const HlsCtor = Hls || (await withTimeout(loadHls(), this.#opts.loadTimeoutMs, 'hls.js load timed out'));
+        hlsOk = !!attempt(() => HlsCtor.isSupported(), false);
+      } catch (err) {
+        hlsError = err;
+      }
+      if (token !== this.#token || session !== this.#session) return;
+    }
+
+    const chain = this.#buildChain(type, hlsOk);
+    if (!chain.length && hlsError) {
+      const f = failure(E.UNKNOWN, 'Couldn’t load the HLS player.', {
+        detail: 'Check your connection and try again.', technical: String(hlsError?.message || hlsError),
+        retryable: true, maxRetries: LIMITED_RETRIES, reason: 'hls-load',
+      });
+      if (this.#opts.autoReconnect) this.#scheduleReconnect(f);
+      else this.#fail(f);
+      return;
+    }
     if (!chain.length) {
       const f = type === 'hls'
         ? failure(E.UNSUPPORTED, MSG.noHls, { detail: MSG.noHlsDetail, reason: 'no-engine' })
@@ -962,8 +1021,7 @@ export class Player extends EventTarget {
     this.#tryEngine(0);
   }
 
-  #buildChain(type) {
-    const hlsOk = !!attempt(() => Hls.isSupported(), false);
+  #buildChain(type, hlsOk) {
     const nativeHls = this.#canPlayNativeHls();
     switch (type) {
       case 'hls': {
@@ -1202,8 +1260,9 @@ export class Player extends EventTarget {
       this.#handleFailure(run, httpFailure(status, { technical, nextEngine }));
       return;
     }
-    if (loadError && !(status > 0) && !run.firstFrame) {
+    if (loadError && !(status > 0) && !run.firstFrame && !this.#session?.everPlayed) {
       // Status 0 before playback: CORS rejection or unreachable host. Native playback doesn't need CORS.
+      // (A stream that already played passed CORS: then the server is just unreachable — keep reconnecting.)
       this.#handleFailure(run, corsFailure(technical));
       return;
     }
@@ -1216,8 +1275,8 @@ export class Player extends EventTarget {
         /* fall through to a full reload */
       }
     }
-    this.#handleFailure(run, networkFailure(timeout ? MSG.serverTimeout : MSG.network,
-      timeout ? 'timeout' : 'network', technical));
+    this.#handleFailure(run, timeout ? this.#timeoutFailure(MSG.serverTimeout, technical)
+      : networkFailure(MSG.network, 'network', technical));
   }
 
   #onHlsMediaError(run, details) {
@@ -1339,12 +1398,12 @@ export class Player extends EventTarget {
       if (errDetail === D.NETWORK_STATUS_CODE_INVALID && status >= 400) {
         const nextEngine = status === 401 || status === 403;
         this.#handleFailure(run, httpFailure(status, { technical, nextEngine }));
-      } else if (errDetail === D.NETWORK_EXCEPTION && !run.firstFrame) {
+      } else if (errDetail === D.NETWORK_EXCEPTION && !run.firstFrame && !this.#session?.everPlayed) {
         this.#handleFailure(run, corsFailure(technical));
       } else {
         const timeout = errDetail === D.NETWORK_TIMEOUT;
-        this.#handleFailure(run, networkFailure(timeout ? MSG.serverTimeout : MSG.network,
-          timeout ? 'timeout' : 'network', technical));
+        this.#handleFailure(run, timeout ? this.#timeoutFailure(MSG.serverTimeout, technical)
+          : networkFailure(MSG.network, 'network', technical));
       }
       return;
     }
@@ -1527,8 +1586,9 @@ export class Player extends EventTarget {
     } else if (err.code === MEDIA_ERR_DECODE) {
       this.#handleFailure(run, mediaFailure(technical, !run.firstFrame));
     } else if (err.code === MEDIA_ERR_SRC_NOT_SUPPORTED) {
-      if (run.firstFrame) {
-        // It played before, so the format is fine: the source went away.
+      if (run.firstFrame || this.#session?.everPlayed) {
+        // It played before, so the format is fine: the source went away (browsers report an unreachable
+        // source this way too).
         this.#handleFailure(run, networkFailure(MSG.network, 'network', technical));
       } else {
         this.#handleFailure(run, failure(E.UNSUPPORTED, MSG.format, { detail: MSG.formatDetail, technical,
@@ -1549,7 +1609,7 @@ export class Player extends EventTarget {
 
     if (state === S.LOADING && !run.firstFrame) {
       if (now - run.loadingSince >= Math.max(this.#opts.loadTimeoutMs, this.#opts.stallTimeoutMs)) {
-        this.#handleFailure(run, networkFailure(MSG.timeout, 'timeout'));
+        this.#handleFailure(run, this.#timeoutFailure(MSG.timeout));
       }
       return;
     }
@@ -1617,6 +1677,14 @@ export class Player extends EventTarget {
       return;
     }
     this.#onCycleFailed(f);
+  }
+
+  /** A timeout. Before the stream ever played in this session it is most likely dead (a server that accepts
+   * connections but never answers): retry only a little instead of spinning for minutes. */
+  #timeoutFailure(message, technical = '') {
+    const f = networkFailure(message, 'timeout', technical);
+    if (!this.#session?.everPlayed) f.maxRetries = LIMITED_RETRIES;
+    return f;
   }
 
   #onCycleFailed(cause) {

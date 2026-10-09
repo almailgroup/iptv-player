@@ -49,6 +49,7 @@
   overflow: hidden;
   isolation: isolate;
   background: var(--player-bg);
+  background-clip: padding-box; /* the translucent border must not darken over --player-bg (light mode) */
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   color: var(--pv-fg);
@@ -815,7 +816,9 @@
   appearance: none;
 }
 .pv-volume-slider:focus-visible {
-  outline: none;
+  outline: 2px solid var(--pv-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-full);
 }
 .pv-volume-slider::-webkit-slider-runnable-track {
   height: 4px;
@@ -931,7 +934,9 @@
   touch-action: none;
 }
 .pv-seek:focus-visible {
-  outline: none;
+  outline: 2px solid var(--pv-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-full);
 }
 .pv-seek-track {
   position: relative;
@@ -1256,7 +1261,7 @@
 .pv-err-btn:focus-visible {
   outline-offset: 2px;
 }
-@container (max-height: 330px) {
+@container (max-height: 300px) {
   .pv-error-card {
     gap: var(--sp-1);
   }
@@ -1372,6 +1377,7 @@
    Now-playing card
    -------------------------------------------------------------------------- */
 .pv-info {
+  container: pv-info / inline-size;
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
@@ -1502,6 +1508,23 @@
   color: var(--favorite);
 }
 
+/* Narrow card (tablets, side-by-side layouts): give the title the full width, actions go below it. Phones
+   (≤ 720px) have their own compact single-row layout further down. */
+@media (min-width: 721px) {
+  @container pv-info (max-width: 540px) {
+    .pv-info-main {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: var(--sp-2) var(--sp-4);
+    }
+    .pv-info-actions {
+      grid-column: 2;
+      margin-left: calc(-1 * var(--sp-2)); /* align the first icon with the title text */
+    }
+  }
+}
+
 /* Idle tips row (shown instead of the card when nothing is playing) */
 .pv-tips {
   display: none;
@@ -1599,6 +1622,18 @@
   }
   .pv-bigplay-wrap {
     padding-bottom: var(--sp-6); /* keep clear of the seek row on short (16:9 at 320px) players */
+  }
+  /* Center the spinner/status in the space above the control bar so "Retry now" never touches it. */
+  .pv-status {
+    padding: var(--sp-2) var(--sp-4) calc(var(--pv-btn) + var(--sp-1));
+  }
+  .pv-status-spinner {
+    width: 32px;
+    height: 32px;
+    margin-bottom: var(--sp-1);
+  }
+  .pv-status-retry {
+    margin-top: var(--sp-2);
   }
   .pv-bigplay {
     width: 60px;

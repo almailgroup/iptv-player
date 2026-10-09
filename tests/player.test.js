@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   hls: [],
@@ -165,7 +165,7 @@ vi.mock('mpegts.js', () => {
   return { default: mpegts };
 });
 
-import { Player, PlayerState, PlayerErrorCode, buildLevelList } from '../src/player/player.js';
+import { Player, PlayerState, PlayerErrorCode, buildLevelList, loadHls } from '../src/player/player.js';
 
 // ---------------------------------------------------------------------------------------------------------
 // Helpers
@@ -281,6 +281,11 @@ function setup(options = {}, videoOptions = {}) {
   player = new Player(ctl.video, { pageProtocol: 'https:', sniff: false, ...options });
   return { ctl, player, events: record(player) };
 }
+
+// hls.js is imported lazily; load it once so engine creation in these tests is synchronous after load().
+beforeAll(async () => {
+  await loadHls();
+});
 
 beforeEach(() => {
   mocks.hls.length = 0;
@@ -797,6 +802,34 @@ describe('Player — reconnect', () => {
     expect(player.attempt).toBe(0);
   });
 
+  it('keeps reconnecting a stream that played when its server becomes unreachable (not CORS)', async () => {
+    vi.useFakeTimers();
+    const { events } = setup();
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsManifestParsed', {});
+    ctl.startPlaying();
+    // Server goes away: fragments fail (in-place startLoad() first), then every reconnect's manifest request
+    // gets no response (status 0).
+    lastHls().emit('hlsError', netError('fragLoadError', 0));
+    lastHls().emit('hlsError', netError('fragLoadError', 0));
+    await flush();
+    for (let i = 0; i < 5; i++) {
+      expect(player.state).toBe('reconnecting');
+      await vi.advanceTimersByTimeAsync(events.of('reconnecting').at(-1).delayMs);
+      lastHls().emit('hlsError', manifestError(0));
+      await flush();
+    }
+    expect(player.state).toBe('reconnecting');
+    const info = events.of('reconnecting').at(-1);
+    expect(info).toMatchObject({ attempt: 6, max: 8, code: 'NETWORK' });
+    // The server comes back.
+    await vi.advanceTimersByTimeAsync(info.delayMs);
+    lastHls().emit('hlsManifestParsed', {});
+    ctl.startPlaying();
+    expect(player.state).toBe('playing');
+    expect(events.of('recovered')).toHaveLength(1);
+  });
+
   it('gives up after maxRetries', async () => {
     vi.useFakeTimers();
     const { events } = setup({ maxRetries: 3 });
@@ -859,6 +892,30 @@ describe('Player — reconnect', () => {
     await vi.advanceTimersByTimeAsync(1500); // timeout at 25 s; the reconnect waits ≥ 800 ms
     expect(player.state).toBe('reconnecting');
     expect(events.of('reconnecting')[0].reason).toBe('The stream took too long to start.');
+  });
+
+  it('gives up on a server that never responds after a few attempts, not minutes', async () => {
+    vi.useFakeTimers();
+    const { events } = setup();
+    await player.load({ url: HLS_URL });
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(events.of('reconnecting').map((r) => r.max)).toEqual([2, 2]);
+    expect(player.state).toBe('error');
+    expect(player.error).toMatchObject({ code: 'NETWORK' });
+    expect(player.error.message).toMatch(/^Couldn’t reconnect after 2 attempts\. The stream took too long/);
+  });
+
+  it('keeps the full retry budget for load timeouts of a stream that already played', async () => {
+    vi.useFakeTimers();
+    const { events } = setup();
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsManifestParsed', {});
+    ctl.startPlaying();
+    await vi.advanceTimersByTimeAsync(16000); // stalls (no progress) → reconnect
+    expect(player.state).not.toBe('error');
+    await vi.advanceTimersByTimeAsync(120000); // every reconnect then times out while loading
+    expect(events.of('reconnecting').length).toBeGreaterThanOrEqual(4);
+    expect(events.of('reconnecting').every((r) => r.max === 8)).toBe(true);
   });
 
   it('restores the VOD position after a reconnect', async () => {
@@ -1078,6 +1135,40 @@ describe('Player — native and mpegts.js engines', () => {
     expect(events.of('reconnecting')[0].code).toBe('NETWORK');
   });
 
+  it('keeps reconnecting a native stream that played when its source becomes unreachable', async () => {
+    vi.useFakeTimers();
+    const { events } = setup();
+    await player.load({ url: 'https://cdn.example.com/live/stream.webm' });
+    ctl.startPlaying();
+    ctl.fail(2); // network error mid-playback
+    await flush();
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(events.of('reconnecting').at(-1).delayMs);
+      ctl.fail(4); // Chrome reports a refused connection on a fresh src as SRC_NOT_SUPPORTED
+      await flush();
+      expect(player.state).toBe('reconnecting');
+    }
+    expect(events.of('reconnecting').at(-1)).toMatchObject({ attempt: 4, max: 8, code: 'NETWORK' });
+  });
+
+  it('keeps reconnecting an MPEG-TS stream that played when the server becomes unreachable', async () => {
+    vi.useFakeTimers();
+    const { events } = setup();
+    await player.load({ url: TS_URL });
+    await vi.waitFor(() => expect(mocks.ts).toHaveLength(1));
+    ctl.startPlaying();
+    lastTs().emit('error', 'NetworkError', 'UnrecoverableEarlyEof', { code: -1, msg: 'eof' });
+    await flush();
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(events.of('reconnecting').at(-1).delayMs);
+      await vi.waitFor(() => expect(mocks.ts).toHaveLength(i + 2));
+      lastTs().emit('error', 'NetworkError', 'Exception', { code: -1, msg: 'Failed to fetch' });
+      await flush();
+      expect(player.state).toBe('reconnecting');
+    }
+    expect(events.of('reconnecting').at(-1)).toMatchObject({ attempt: 4, max: 8, code: 'NETWORK' });
+  });
+
   it('ignores aborted media errors', async () => {
     setup();
     await player.load({ url: 'https://cdn.example.com/movie.mp4' });
@@ -1273,6 +1364,19 @@ describe('Player — controls and lifecycle', () => {
     });
     expect(stats).toHaveProperty('droppedFrames');
     expect(stats).toHaveProperty('totalFrames');
+  });
+
+  it('getStats() labels a plain media playlist (no RESOLUTION/BANDWIDTH) by the decoded height', async () => {
+    setup();
+    await player.load({ url: HLS_URL });
+    const hls = lastHls();
+    hls.levels = [{ height: 0, width: 0, bitrate: 0 }];
+    hls.currentLevel = 0;
+    hls.emit('hlsManifestParsed', {});
+    ctl.m.videoWidth = 640;
+    ctl.m.videoHeight = 360;
+    ctl.startPlaying(1);
+    expect(player.getStats()).toMatchObject({ level: '360p', bitrate: 0 });
   });
 
   it('setOptions applies lowLatency to the running hls.js instance', async () => {

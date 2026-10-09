@@ -1040,7 +1040,8 @@ export function createController(store) {
   function play(channel, { record = true } = {}) {
     if (!channel || typeof channel.url !== 'string' || !channel.url) return;
     store.set((s) => {
-      const patch = { currentChannel: channel, playRequest: s.playRequest + 1 };
+      // playbackState resets in the same update so the list never paints the previous channel's state.
+      const patch = { currentChannel: channel, playRequest: s.playRequest + 1, playbackState: 'loading' };
       if (record) {
         const snap = { ...channelToSnapshot(channel, playlistIdFor(s, channel)), watchedAt: Date.now() };
         patch.recents = [snap, ...s.recents.filter((r) => r.id !== channel.id)].slice(0, MAX_RECENTS);
