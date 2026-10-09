@@ -1,0 +1,11 @@
+{
+  "name": "IPTV Player",
+  "short_name": "IPTV",
+  "description": "A fast, minimalist web IPTV player for M3U/M3U8 playlists.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0a0c10",
+  "theme_color": "#0a0c10",
+  "icons": [{ "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

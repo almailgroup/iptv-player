@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en" data-mode="dark" data-accent="azure">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>IPTV Player</title>
+    <meta
+      name="description"
+      content="A fast, minimalist web IPTV player. Load M3U/M3U8 playlists by URL or file, browse by category, search, and pin favorites."
+    />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0a0c10" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src * data: blob:; media-src * data: blob:; connect-src *; worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script src="/theme-init.js"></script>
+  </head>
+  <body>
+    <noscript>
+      <p style="padding: 24px; font-family: system-ui, sans-serif">IPTV Player needs JavaScript enabled to run.</p>
+    </noscript>
+    <div id="app" class="app" data-ready="false">
+      <aside id="sidebar" class="sidebar" aria-label="Library"></aside>
+      <div class="sidebar-backdrop" data-action="close-sidebar" hidden></div>
+      <section id="channels" class="channels" aria-label="Channels"></section>
+      <main id="stage" class="stage" aria-label="Player"></main>
+    </div>
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
