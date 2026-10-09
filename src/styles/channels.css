@@ -1,0 +1,538 @@
+/* ==========================================================================
+   Channel list (prefix cl-) — header, search, virtualized rows, empty & loading states.
+   The #channels column itself (width, drawer/stacking behaviour) is sized by layout.css; .cl fills it.
+   ========================================================================== */
+
+.cl {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+}
+
+/* Several controls use display utilities (.icon-btn, .input-group …) — make [hidden] always win here. */
+.cl [hidden] {
+  display: none !important;
+}
+
+/* --------------------------------------------------------------------------
+   Header
+   -------------------------------------------------------------------------- */
+.cl-header {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: 10px var(--sp-3) var(--sp-3) var(--sp-4);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Row 1 is 36px tall and starts 10px down, so its centre lines up with the sidebar's 56px brand row. */
+.cl-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 36px;
+  min-width: 0;
+}
+
+.cl-menu-btn {
+  display: none;
+  margin-left: -6px;
+}
+
+.cl-heading {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+}
+
+.cl-title {
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.cl-count {
+  min-height: 1.35em;
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.cl-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  margin-right: -4px;
+}
+
+/* Non-default sort order: a quiet accent dot instead of a fully highlighted button. */
+.cl-sort-btn {
+  position: relative;
+}
+.cl-sort-btn.is-sorted::after {
+  content: '';
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg);
+  pointer-events: none;
+}
+
+/* --------------------------------------------------------------------------
+   Search
+   -------------------------------------------------------------------------- */
+.cl-search {
+  flex: none;
+  min-width: 0;
+}
+.cl-search > .icon:first-child {
+  left: 11px;
+}
+.cl-search > .cl-search-input {
+  padding-left: 34px;
+  padding-right: 40px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.cl-search-input::-webkit-search-cancel-button,
+.cl-search-input::-webkit-search-decoration,
+.cl-search-input::-webkit-search-results-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+.cl-search:focus-within > .icon:first-child {
+  color: var(--text-muted);
+}
+.cl-search > .input-trailing {
+  right: 4px;
+}
+.cl-search-clear {
+  color: var(--text-faint);
+}
+
+.cl-kbd {
+  min-width: 20px;
+  height: 20px;
+  margin-right: 4px;
+  padding: 0 5px;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.cl-search:focus-within .cl-kbd {
+  opacity: 0;
+}
+
+/* "Only 2 matches in Sports · Search all channels" */
+.cl-scope {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  margin-top: calc(-1 * var(--sp-1));
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+.cl-scope-text {
+  flex: 1 1 auto;
+}
+.cl-link {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  margin-right: -6px;
+  padding: 0 6px;
+  border-radius: var(--radius-xs);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--accent-text);
+  transition: background-color var(--dur-fast) var(--ease);
+}
+.cl-link:hover {
+  background: var(--accent-soft);
+}
+.cl-link > .icon {
+  transition: transform var(--dur-fast) var(--ease);
+}
+.cl-link:hover > .icon {
+  transform: translateX(2px);
+}
+
+/* --------------------------------------------------------------------------
+   Body + virtual list
+   -------------------------------------------------------------------------- */
+.cl-body {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.cl-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  contain: strict;
+  padding-bottom: max(var(--sp-2), env(safe-area-inset-bottom));
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
+}
+.cl-list:focus-visible {
+  outline: none;
+}
+/* Focused without a cursor row (shouldn't normally happen) — still show where focus is. */
+.cl-list:focus-visible:not([aria-activedescendant]) {
+  box-shadow: inset 0 0 0 2px var(--accent-ring);
+}
+
+/* --------------------------------------------------------------------------
+   Rows — full-width hit area, the visible "pill" is the ::before layer (inset 2px / 8px)
+   -------------------------------------------------------------------------- */
+.cl-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-3) 0 var(--sp-4);
+  color: var(--text);
+  cursor: pointer;
+  contain: strict;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.cl-row::before {
+  content: '';
+  position: absolute;
+  inset: 2px var(--sp-2);
+  z-index: -1;
+  border-radius: var(--radius);
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+}
+@media (hover: hover) {
+  .cl-row:hover::before {
+    background: var(--surface-hover);
+  }
+}
+.cl-row:active::before {
+  background: var(--surface-active);
+}
+
+.cl-row.is-current::before {
+  background: var(--accent-soft);
+}
+.cl-row.is-current .cl-name {
+  color: var(--accent-text);
+}
+
+/* Keyboard cursor (only while the listbox has keyboard focus) */
+.cl-list.is-kbd .cl-row.is-cursor::before {
+  box-shadow: inset 0 0 0 1.5px var(--accent-ring);
+}
+.cl-list.is-kbd .cl-row.is-cursor:not(.is-current)::before {
+  background: var(--surface-hover);
+}
+
+/* Avatar: neutral tile while the logo loads, logo fades in, initials when there is none. */
+.cl-avatar {
+  --size: 40px;
+}
+.cl-avatar img {
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.cl-avatar.is-loaded img {
+  opacity: 1;
+}
+
+.cl-text {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.cl-name {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  line-height: 1.3;
+}
+.cl-name .hl {
+  padding: 0;
+  border-radius: 2px;
+}
+.cl-meta {
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+.cl-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--surface-2);
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-medium);
+  line-height: 15px;
+  vertical-align: 1px;
+}
+.cl-meta > .cl-tag:first-child {
+  margin-left: 0;
+}
+
+/* Now-playing equalizer */
+.cl-eq {
+  display: none;
+  flex: none;
+  align-items: flex-end;
+  gap: 2px;
+  width: 13px;
+  height: 12px;
+  color: var(--accent);
+}
+.cl-row.is-current .cl-eq {
+  display: inline-flex;
+}
+.cl-eq i {
+  flex: 1;
+  height: 100%;
+  border-radius: 1px;
+  background: currentColor;
+  transform-origin: 50% 100%;
+  transform: scaleY(0.4);
+  animation: cl-eq 1.1s var(--ease-in-out) infinite;
+}
+.cl-eq i:nth-child(1) {
+  animation-delay: -0.25s;
+}
+.cl-eq i:nth-child(2) {
+  animation-duration: 0.85s;
+  animation-delay: -0.6s;
+}
+.cl-eq i:nth-child(3) {
+  animation-duration: 1.3s;
+  animation-delay: -0.45s;
+}
+@keyframes cl-eq {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+/* Favorite star — revealed on hover / keyboard cursor, always shown when starred */
+.cl-star {
+  flex: none;
+  margin-right: -4px;
+  color: var(--text-faint);
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease);
+}
+@media (hover: hover) {
+  .cl-row:hover .cl-star {
+    opacity: 1;
+  }
+}
+.cl-list.is-kbd .cl-row.is-cursor .cl-star,
+.cl-star:focus-visible {
+  opacity: 1;
+}
+.cl-star:hover:not(:disabled) {
+  color: var(--favorite);
+}
+.cl-star[aria-pressed='true'] {
+  opacity: 1;
+  color: var(--favorite);
+  background: transparent;
+}
+.cl-star[aria-pressed='true']:hover:not(:disabled) {
+  color: var(--favorite);
+  background: var(--surface-hover);
+}
+@media (hover: none) {
+  .cl-star {
+    opacity: 1;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Empty states & skeleton
+   -------------------------------------------------------------------------- */
+.cl-empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 0;
+  padding-bottom: 6vh;
+  overflow-y: auto;
+}
+.cl-empty-state {
+  width: 100%;
+}
+.cl-empty-state h3 {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.cl-skeleton {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.cl-skel-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: 56px;
+  padding: 0 var(--sp-3) 0 var(--sp-4);
+}
+.cl-skel-row:nth-child(2) {
+  opacity: 0.85;
+}
+.cl-skel-row:nth-child(3) {
+  opacity: 0.7;
+}
+.cl-skel-row:nth-child(4) {
+  opacity: 0.55;
+}
+.cl-skel-row:nth-child(5) {
+  opacity: 0.4;
+}
+.cl-skel-row:nth-child(6) {
+  opacity: 0.25;
+}
+.cl-skel-avatar {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+}
+.cl-skel-lines {
+  flex: 1 1 auto;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.cl-skel-line {
+  height: 10px;
+}
+.cl-skel-line-sm {
+  height: 8px;
+  opacity: 0.7;
+}
+
+/* --------------------------------------------------------------------------
+   Responsive & input-modality tweaks
+   -------------------------------------------------------------------------- */
+@media (max-width: 1100px) {
+  .cl-menu-btn {
+    display: inline-grid;
+  }
+}
+
+@media (max-width: 720px) {
+  .cl {
+    border-right: 0;
+    border-top: 1px solid var(--border);
+  }
+  .cl-header {
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  }
+  .cl-title {
+    font-size: var(--fs-md);
+  }
+  .cl-menu-btn {
+    margin-left: -4px;
+  }
+}
+
+/* Phones held sideways go back to side-by-side columns (see layout.css). */
+@media (max-width: 720px) and (orientation: landscape) and (max-height: 540px) {
+  .cl {
+    border-top: 0;
+    border-right: 1px solid var(--border);
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .cl-kbd {
+    display: none;
+  }
+}
+
+@media (pointer: coarse) {
+  /* ≥16px stops iOS Safari from zooming the page when the field is focused. */
+  .cl-search > .cl-search-input {
+    font-size: 16px;
+  }
+  .cl-star {
+    width: 40px;
+    height: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cl-eq i {
+    animation: none;
+  }
+  .cl-eq i:nth-child(1) {
+    transform: scaleY(0.55);
+  }
+  .cl-eq i:nth-child(2) {
+    transform: scaleY(1);
+  }
+  .cl-eq i:nth-child(3) {
+    transform: scaleY(0.7);
+  }
+  .cl-skeleton .skeleton {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .cl-row.is-current::before {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  .cl-list.is-kbd .cl-row.is-cursor::before {
+    outline: 2px dashed CanvasText;
+    outline-offset: -2px;
+  }
+}
