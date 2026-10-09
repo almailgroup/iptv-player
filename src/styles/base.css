@@ -590,6 +590,12 @@ button.chip:hover {
     background-position: -200% 0;
   }
 }
+@media (prefers-reduced-motion: reduce) {
+  .skeleton,
+  .badge-live::before {
+    animation: none;
+  }
+}
 
 /* --------------------------------------------------------------------------
    Avatar (channel logo with initials fallback)
@@ -659,7 +665,8 @@ button.chip:hover {
   transform: none;
 }
 
-.menu {
+.menu,
+.menu-group {
   display: grid;
   gap: 1px;
 }
@@ -823,6 +830,18 @@ button.chip:hover {
   .toast {
     min-width: 0;
     max-width: none;
+  }
+}
+/* Phones show dialogs as bottom sheets (dialogs.css): toasts rendered inside one go to the top of the
+   screen so they never cover the sheet's action buttons. Newest first, sliding in from above. */
+@media (max-width: 639.98px) {
+  dialog .toasts {
+    top: max(var(--sp-3), env(safe-area-inset-top));
+    bottom: auto;
+    flex-direction: column-reverse;
+  }
+  dialog .toast {
+    transform: translateY(-8px);
   }
 }
 

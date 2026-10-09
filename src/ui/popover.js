@@ -6,6 +6,21 @@ import { h } from '../lib/dom.js';
 import { icon } from './icons.js';
 
 let active = null;
+let labelSeq = 0;
+
+const TABBABLE =
+  'button:not([disabled]), [href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), ' +
+  'textarea:not([disabled]), [tabindex]';
+
+/** True when Tab (or Shift+Tab) from the focused element would move focus out of `panel`. */
+function tabLeavesPanel(panel, backwards) {
+  const tabbables = [...panel.querySelectorAll(TABBABLE)].filter(
+    (node) => node.tabIndex >= 0 && !node.closest('[hidden], [inert]'),
+  );
+  if (!tabbables.length) return true;
+  const edge = backwards ? tabbables[0] : tabbables[tabbables.length - 1];
+  return document.activeElement === edge || !tabbables.includes(document.activeElement);
+}
 
 /** Close the currently open popover, if any. */
 export function closePopover() {
@@ -94,8 +109,16 @@ export function openPopover(opts) {
       e.stopPropagation();
       close();
       anchor.focus?.();
-    } else if (e.key === 'Tab' && !el.contains(document.activeElement)) {
-      close();
+    } else if (e.key === 'Tab') {
+      if (!el.contains(document.activeElement)) {
+        close();
+      } else if (tabLeavesPanel(el, e.shiftKey)) {
+        // The panel sits at the end of its container, so the browser would move focus to the end of the
+        // document. Hand focus back to the anchor first: the default Tab action then continues from there,
+        // as if the panel were placed right after its anchor.
+        close();
+        anchor.focus?.({ preventScroll: true });
+      }
     }
   };
   const onFocusOut = () => {
@@ -155,15 +178,25 @@ export function openMenu({ anchor, items, placement = 'bottom-start', container,
   const menu = h('div', { class: 'menu', role: 'menu', 'aria-label': label });
   const buttons = [];
   let handle;
+  // A menu may only contain menu items, separators and groups: a label starts a labelled group that runs
+  // until the next separator / label.
+  let parent = menu;
 
   for (const item of items) {
     if (!item) continue;
     if (item.type === 'separator') {
+      parent = menu;
       menu.append(h('div', { class: 'menu-separator', role: 'separator' }));
       continue;
     }
     if (item.type === 'label') {
-      menu.append(h('div', { class: 'menu-label', text: item.label }));
+      const id = `menu-label-${++labelSeq}`;
+      parent = h(
+        'div',
+        { class: 'menu-group', role: 'group', 'aria-labelledby': id },
+        h('div', { class: 'menu-label', id, 'aria-hidden': 'true', text: item.label }),
+      );
+      menu.append(parent);
       continue;
     }
     const isRadio = typeof item.checked === 'boolean';
@@ -187,7 +220,7 @@ export function openMenu({ anchor, items, placement = 'bottom-start', container,
       isRadio && item.checked ? icon('check', { size: 16, class: 'menu-check' }) : null,
     );
     buttons.push(btn);
-    menu.append(btn);
+    parent.append(btn);
   }
 
   const enabled = () => buttons.filter((b) => !b.disabled);

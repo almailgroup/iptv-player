@@ -346,6 +346,15 @@
   .sb-item {
     height: 40px;
   }
+  .sb-sort {
+    width: 36px;
+    height: 36px;
+    margin-right: -6px;
+  }
+  .sb-filter-clear {
+    width: 30px;
+    height: 30px;
+  }
   .sb-group {
     height: 38px;
   }

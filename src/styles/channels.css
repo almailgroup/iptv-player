@@ -65,12 +65,15 @@
 }
 
 .cl-count {
-  min-height: 1.35em;
   margin-top: 2px;
   font-size: var(--fs-xs);
   line-height: 1.35;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
+}
+/* No count (no playlist yet): let the title centre on the row like the sidebar's wordmark. */
+.cl-count:empty {
+  display: none;
 }
 
 .cl-actions {
@@ -330,6 +333,19 @@
   transform-origin: 50% 100%;
   transform: scaleY(0.4);
   animation: cl-eq 1.1s var(--ease-in-out) infinite;
+  /* Frozen (static bars) unless the stream is actually playing — see [data-playback] (channel-list.js). */
+  animation-play-state: paused;
+}
+.cl-row[data-playback='playing'] .cl-eq i {
+  animation-play-state: running;
+}
+/* Playback failed: flat, danger-colored bars instead of a "playing" indicator. */
+.cl-row[data-playback='error'] .cl-eq {
+  color: var(--danger);
+}
+.cl-row[data-playback='error'] .cl-eq i {
+  animation: none;
+  transform: scaleY(0.25);
 }
 .cl-eq i:nth-child(1) {
   animation-delay: -0.25s;

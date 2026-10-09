@@ -77,10 +77,33 @@ export function toast(message, opts = {}) {
   );
 
   const start = () => {
+    clearTimeout(timer);
     if (duration > 0) timer = setTimeout(dismiss, duration);
   };
-  el.addEventListener('pointerenter', () => clearTimeout(timer));
-  el.addEventListener('pointerleave', start);
+  // Hold the toast while it is hovered or holds keyboard focus (e.g. tabbing to its action button).
+  let hovered = false;
+  let focused = false;
+  const hold = () => clearTimeout(timer);
+  const release = () => {
+    if (!hovered && !focused) start();
+  };
+  el.addEventListener('pointerenter', () => {
+    hovered = true;
+    hold();
+  });
+  el.addEventListener('pointerleave', () => {
+    hovered = false;
+    release();
+  });
+  el.addEventListener('focusin', () => {
+    focused = true;
+    hold();
+  });
+  el.addEventListener('focusout', (e) => {
+    if (el.contains(e.relatedTarget)) return;
+    focused = false;
+    release();
+  });
 
   container.append(el);
   const toasts = container.querySelectorAll('.toast:not(.is-leaving)');

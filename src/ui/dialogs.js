@@ -1003,7 +1003,7 @@ export function openSettingsDialog({ store, actions }) {
       h('span', {
         class: 'dlg-row-hint',
         id: `${retriesId}-hint`,
-        text: 'Reconnect attempts before giving up (1–30).',
+        text: 'Reconnect attempts before giving up (1\u2060–\u206030).',
       }),
     ),
     retries,

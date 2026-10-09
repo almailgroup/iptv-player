@@ -35,6 +35,10 @@ const SKELETON_WIDTHS = [
   [66, 28],
 ];
 const MAX_FAILED_LOGOS = 5000;
+/** PlayerState values published by the player view as `state.playbackState` (anything else = idle). */
+const PLAYBACK_STATES = new Set(['idle', 'loading', 'playing', 'paused', 'buffering', 'reconnecting', 'error']);
+const playbackOf = (state) => (PLAYBACK_STATES.has(state.playbackState) ? state.playbackState : 'idle');
+const NOW_PLAYING_LABEL = { paused: 'paused', error: 'playback failed' };
 
 /** Store keys whose changes can affect this panel (everything else, e.g. volume, is ignored). */
 const WATCHED_KEYS = [
@@ -87,6 +91,7 @@ export function createChannelList({ store, actions }) {
   let favIds = new Set();
   let currentId = null;
   let showLogos = true;
+  let playback = 'idle'; // playback state of the current channel (drives its equalizer)
   let activePlaylistId = null;
   let cursor = -1; // keyboard cursor: index into items, -1 = none
   let modeKey = '';
@@ -265,9 +270,14 @@ export function createChannelList({ store, actions }) {
         type: 'button',
         class: 'icon-btn icon-btn-sm cl-star',
         tabIndex: -1,
+        // Pointer shortcut only: options can't own interactive children, and the row's label already
+        // says "favorite". Keyboard / AT users star channels from the now-playing card or with `s`.
+        'aria-hidden': 'true',
         'aria-pressed': 'false',
         'aria-label': 'Add to favorites',
         title: 'Add to favorites',
+        // Keep focus (and the listbox's active descendant) where it is when the star is clicked.
+        onMousedown: (e) => e.preventDefault(),
       },
       icon('star', { size: 16 }),
     );
@@ -293,6 +303,7 @@ export function createChannelList({ store, actions }) {
       other: null,
       fav: null,
       current: null,
+      playback: '',
       cursor: null,
       label: '',
     });
@@ -352,6 +363,13 @@ export function createChannelList({ store, actions }) {
       if (current) row.setAttribute('aria-current', 'true');
       else row.removeAttribute('aria-current');
     }
+    // CSS animates the equalizer only while playing; other states freeze it (error: danger-colored).
+    const rowPlayback = current ? playback : '';
+    if (r.playback !== rowPlayback) {
+      r.playback = rowPlayback;
+      if (rowPlayback) row.dataset.playback = rowPlayback;
+      else delete row.dataset.playback;
+    }
 
     const isCursor = index === cursor;
     if (r.cursor !== isCursor) {
@@ -365,7 +383,7 @@ export function createChannelList({ store, actions }) {
       channel.group,
       channel.chno != null ? `channel ${channel.chno}` : '',
       other ? 'from another playlist' : '',
-      current ? 'now playing' : '',
+      current ? NOW_PLAYING_LABEL[playback] || 'now playing' : '',
       fav ? 'favorite' : '',
     ]
       .filter(Boolean)
@@ -403,8 +421,12 @@ export function createChannelList({ store, actions }) {
    */
   function renderAvatar(r, channel, logo) {
     const { avatar } = r;
+    const previous = r.img;
     r.logo = logo;
     r.img = null;
+    // Cancel the recycled row's logo download: after a fast flick through a long list, hundreds of
+    // requests for rows that are long gone would otherwise queue ahead of the logos now on screen.
+    if (previous && !previous.complete) previous.removeAttribute('src');
     clear(avatar);
     if (!logo || failedLogos.has(logo)) {
       showInitials(r, channel.name);
@@ -418,8 +440,9 @@ export function createChannelList({ store, actions }) {
       if (r.img === img) avatar.classList.add('is-loaded');
     });
     img.addEventListener('error', () => {
+      if (r.img !== img) return; // replaced (and possibly cancelled) — not a broken logo
       rememberFailedLogo(logo);
-      if (r.img === img) showInitials(r, channel.name);
+      showInitials(r, channel.name);
     });
     r.img = img;
     img.src = logo;
@@ -869,9 +892,26 @@ export function createChannelList({ store, actions }) {
     if (index >= 0) vl.scrollToIndex(index, 'auto');
   }
 
+  /** Mirror `state.playbackState`; returns true when it changed. */
+  function syncPlayback(state) {
+    const next = playbackOf(state);
+    if (next === playback) return false;
+    playback = next;
+    return true;
+  }
+
+  /** Repaint only the current channel's row (equalizer + label) — playback state changes often. */
+  function repaintCurrent() {
+    if (currentId) repaintRow(vl.indexOfKey(currentId));
+  }
+
   function update(state, prev) {
     if (destroyed) return;
-    if (prev && WATCHED_KEYS.every((k) => state[k] === prev[k])) return;
+    if (prev && WATCHED_KEYS.every((k) => state[k] === prev[k])) {
+      if (syncPlayback(state)) repaintCurrent();
+      return;
+    }
+    const playbackChanged = syncPlayback(state);
 
     const v = selectVisibleChannels(state);
     const nextFav = selectFavoriteIds(state);
@@ -946,7 +986,7 @@ export function createChannelList({ store, actions }) {
     } else if (rowsDirty) {
       vl.refresh();
       if (currentChanged) followCurrent();
-    }
+    } else if (playbackChanged) repaintCurrent();
 
     renderHeader(state, v, mode);
   }
