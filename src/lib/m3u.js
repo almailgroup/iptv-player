@@ -39,6 +39,16 @@ const MAX_NAME_LENGTH = 300;
 const MAX_GROUP_LENGTH = 200;
 /** Upper bound on groups per channel (group-title="a;b;c;…"). */
 const MAX_GROUPS_PER_CHANNEL = 24;
+/**
+ * Upper bound on distinct groups per playlist. The sidebar renders one button per group, so a hostile
+ * playlist with 100k+ tiny groups would otherwise freeze the tab on every start-up (it is cached).
+ */
+const MAX_GROUPS = 3000;
+/** Longest logo URL we keep: data: URIs are copied into favorites/recents in localStorage. */
+const MAX_LOGO_LENGTH = 16384;
+/** Longest stream URL / header value we accept (they are copied into favorites/recents too). */
+const MAX_URL_LENGTH = 8192;
+const MAX_HEADER_LENGTH = 1024;
 
 const LINE_SPLIT_RE = /\r\n|\r|\n/;
 const SCHEME_RE = /^([a-z][a-z0-9+.-]*):/i;
@@ -365,6 +375,7 @@ function httpResult(url) {
  */
 function classifyUrl(raw, base) {
   if (!raw) return { kind: 'text' };
+  if (raw.length > MAX_URL_LENGTH) return { kind: 'invalid' };
   if (isHttpPrefix(raw)) return httpResult(tryParseUrl(raw));
 
   if (raw.startsWith('//')) {
@@ -398,7 +409,7 @@ function classifyUrl(raw, base) {
  * logo query strings (and our own exports escape `"` as `&quot;`), so entities are decoded first.
  */
 function resolveLogo(raw, base) {
-  if (!raw) return '';
+  if (!raw || raw.length > MAX_LOGO_LENGTH) return '';
   const decoded = raw.indexOf('&') === -1 ? raw : decodeEntities(raw);
   if (isHttpPrefix(decoded)) return safeImageUrl(decoded);
   const value = decoded.trim();
@@ -418,7 +429,7 @@ function resolveLogo(raw, base) {
 
 /** Map a header / VLC option name to our headers shape. Returns true when the key was recognized. */
 function applyHeader(headers, key, value) {
-  if (!value) return false;
+  if (!value || value.length > MAX_HEADER_LENGTH) return false;
   switch (key) {
     case 'user-agent':
     case 'http-user-agent':
@@ -629,6 +640,8 @@ export function parseM3U(text, { baseUrl } = {}) {
   const groupCache = new Map();
   const extGroupCache = new Map();
   const unsupportedSchemes = new Set();
+  const knownGroups = new Set();
+  let droppedGroups = 0;
   let unsupportedCount = 0;
   let drmCount = 0;
   let invalidCount = 0;
@@ -650,11 +663,23 @@ export function parseM3U(text, { baseUrl } = {}) {
     drm = false;
   };
 
+  /** Keep only groups that exist already or still fit under MAX_GROUPS. */
+  const admitGroups = (list) =>
+    list.filter((name) => {
+      if (knownGroups.has(name)) return true;
+      if (knownGroups.size >= MAX_GROUPS) {
+        droppedGroups++;
+        return false;
+      }
+      knownGroups.add(name);
+      return true;
+    });
+
   // Channels with the same group-title share one frozen groups array (less work, far less memory).
   const groupsFor = (raw) => {
     let groups = groupCache.get(raw);
     if (groups === undefined) {
-      const list = splitGroups(raw);
+      const list = admitGroups(splitGroups(raw));
       groups = list.length ? Object.freeze(list) : null;
       groupCache.set(raw, groups);
     }
@@ -664,8 +689,8 @@ export function parseM3U(text, { baseUrl } = {}) {
   const singleGroup = (raw) => {
     let groups = extGroupCache.get(raw);
     if (groups === undefined) {
-      const name = displayText(raw, MAX_GROUP_LENGTH);
-      groups = name ? Object.freeze([name]) : null;
+      const list = admitGroups([displayText(raw, MAX_GROUP_LENGTH)].filter(Boolean));
+      groups = list.length ? Object.freeze(list) : null;
       extGroupCache.set(raw, groups);
     }
     return groups;
@@ -739,11 +764,12 @@ export function parseM3U(text, { baseUrl } = {}) {
 
     // Header precedence: EXTINF attributes < #EXTVLCOPT / #EXTHTTP < pipe headers.
     const channelHeaders = {};
-    const attrAgent = attrs['http-user-agent'] || attrs['user-agent'];
-    if (attrAgent) channelHeaders.userAgent = attrAgent;
-    const attrReferrer =
-      attrs['http-referrer'] || attrs['http-referer'] || attrs.referrer || attrs.referer;
-    if (attrReferrer) channelHeaders.referrer = attrReferrer;
+    applyHeader(channelHeaders, 'user-agent', attrs['http-user-agent'] || attrs['user-agent']);
+    applyHeader(
+      channelHeaders,
+      'referrer',
+      attrs['http-referrer'] || attrs['http-referer'] || attrs.referrer || attrs.referer,
+    );
     if (headers) Object.assign(channelHeaders, headers);
     if (pipe !== -1) parsePipeHeaders(urlLine.slice(pipe + 1), channelHeaders);
 
@@ -782,7 +808,7 @@ export function parseM3U(text, { baseUrl } = {}) {
       group: groups[0],
       groups,
       logo,
-      tvgId: tvgId ? decodeEntities(tvgId) : '',
+      tvgId: tvgId ? decodeEntities(tvgId).slice(0, MAX_NAME_LENGTH) : '',
       tvgName,
       chno: parseChno(attrs),
       duration: entry ? entry.duration : -1,
@@ -823,6 +849,9 @@ export function parseM3U(text, { baseUrl } = {}) {
   }
   if (orphanCount) {
     warnings.push(`Skipped ${plural(orphanCount, 'entry', 'entries')} without a stream URL.`);
+  }
+  if (droppedGroups) {
+    warnings.push(`Only the first ${formatCount(MAX_GROUPS)} groups are shown; the other groups were ignored.`);
   }
 
   return { channels, meta, warnings };

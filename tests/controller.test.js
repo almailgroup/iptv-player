@@ -869,6 +869,23 @@ describe('init', () => {
     expect(location.search).toBe('?keep=1');
   });
 
+  it('ignores link parameters when the app is embedded in another page', async () => {
+    const stream = 'https://cdn.example/live/stream.m3u8';
+    history.replaceState(null, '', `/?play=${encodeURIComponent(stream)}&playlist=${encodeURIComponent(URL_B)}`);
+    const desc = Object.getOwnPropertyDescriptor(window, 'top');
+    Object.defineProperty(window, 'top', { configurable: true, get: () => ({}) });
+    try {
+      const { store, actions } = setup();
+      await actions.init();
+      expect(store.get().currentChannel).toBeNull();
+      expect(store.get().playlists).toEqual([]);
+      expect(fetchPlaylist).not.toHaveBeenCalled();
+    } finally {
+      if (desc) Object.defineProperty(window, 'top', desc);
+      else delete window.top;
+    }
+  });
+
   it('handles ?playlist= by switching to a known URL or adding a new one', async () => {
     seedPlaylist({ id: 'pl_one', url: URL_A });
     seedPlaylist({ id: 'pl_two', url: URL_B, text: m3u(ENTRIES.slice(0, 2)) });
@@ -886,6 +903,13 @@ describe('init', () => {
     history.replaceState(null, '', `/?playlist=${encodeURIComponent(fresh)}&name=Shared`);
     const second = setup();
     await second.actions.init();
+    // Unknown URLs are only added after the user confirms the prompt.
+    expect(fetchPlaylist).not.toHaveBeenCalled();
+    expect(second.store.get().playlists).toHaveLength(2);
+    const prompt = toast.info.mock.calls.find(([msg, opts]) => /other\.example/.test(msg) && opts?.action);
+    expect(prompt).toBeTruthy();
+    prompt[1].action.onClick();
+    await vi.waitFor(() => expect(second.store.get().playlists).toHaveLength(3));
     expect(fetchPlaylist).toHaveBeenCalledWith(fresh, expect.any(Object));
     expect(second.store.get().playlists).toHaveLength(3);
     expect(second.store.get().playlists.at(-1)).toMatchObject({ name: 'Shared', source: { url: fresh } });

@@ -124,6 +124,8 @@ const MPEGTS_CONFIG = Object.freeze({
   liveBufferLatencyMaxLatency: 6,
   liveBufferLatencyMinRemain: 1.5,
   autoCleanupSourceBuffer: true,
+  // mpegts.js defaults to 'no-referrer-when-downgrade' (full page URL); match the page's origin-only policy.
+  referrerPolicy: 'strict-origin-when-cross-origin',
 });
 
 /** Error codes that mean "couldn't reach / fetch it" — used to decide whether an https upgrade failed. */

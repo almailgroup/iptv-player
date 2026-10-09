@@ -1065,10 +1065,20 @@ export function createController(store) {
   // ---- Start-up -------------------------------------------------------------------------------------------
 
   /** Read and strip `?playlist=` / `?play=` / `?name=` from the address bar. */
+  /** True when embedded in another page's frame (or when that can't be determined). */
+  function isFramed() {
+    try {
+      return globalThis.top !== globalThis.self;
+    } catch {
+      return true;
+    }
+  }
+
   function takeQueryParams() {
     const loc = globalThis.location;
     const empty = { playlist: '', play: '', name: '' };
     if (!loc || !loc.search) return empty;
+    if (isFramed()) return empty; // a framing page must not be able to inject playlists or streams
     const params = new URLSearchParams(loc.search);
     if (!params.has('playlist') && !params.has('play') && !params.has('name')) return empty;
     const result = {
@@ -1087,6 +1097,17 @@ export function createController(store) {
       /* sandboxed / file: URLs — leaving the params in place is harmless */
     }
     return result;
+  }
+
+  function offerSharedPlaylist(url, name) {
+    const host = tryParseUrl(url)?.host || url;
+    toast.info(`This link wants to add a playlist from “${host}”.`, {
+      duration: 0,
+      action: {
+        label: 'Add playlist',
+        onClick: () => actions.addPlaylistFromUrl({ url, name }).catch(noop),
+      },
+    });
   }
 
   async function runInit() {
@@ -1147,15 +1168,9 @@ export function createController(store) {
     store.set({ ready: true });
 
     // Phase 2 — network.
-    if (addUrl) {
-      try {
-        const name = direct ? undefined : params.name || undefined;
-        await actions.addPlaylistFromUrl({ url: addUrl, name });
-        return;
-      } catch {
-        /* already reported; fall back to the stored playlist */
-      }
-    }
+    // A shared ?playlist= link for an unknown URL is only added after the user confirms it, so a link
+    // can't silently install (and keep auto-refreshing) a third-party playlist.
+    if (addUrl) offerSharedPlaylist(addUrl, direct ? undefined : params.name || undefined);
     if (needsDownload && target && findPlaylist(target.id) && get().activePlaylistId === target.id) {
       await activate(findPlaylist(target.id), { resetView: false }).catch(noop);
     } else if (shown && target) {

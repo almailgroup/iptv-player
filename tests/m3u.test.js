@@ -1009,3 +1009,39 @@ describe('robustness and performance', () => {
     expect(elapsed).toBeLessThan(1500);
   });
 });
+
+describe('parseM3U — hostile-input limits', () => {
+  it('caps distinct groups per playlist and files the rest under Uncategorized', () => {
+    const lines = ['#EXTM3U'];
+    for (let i = 0; i < 3100; i++) {
+      lines.push(`#EXTINF:-1 group-title="G${i};H${i}",Channel ${i}`, `https://x.test/${i}.m3u8`);
+    }
+    const { channels, warnings } = parseM3U(lines.join('\n'));
+    const groups = groupChannels(channels);
+    expect(channels).toHaveLength(3100);
+    expect(groups.length).toBeLessThanOrEqual(3001); // 3,000 + Uncategorized
+    expect(groups.some((g) => g.name === UNCATEGORIZED)).toBe(true);
+    expect(channels[0].groups).toEqual(['G0', 'H0']); // early channels keep their groups
+    expect(channels[3099].group).toBe(UNCATEGORIZED);
+    expect(warnings.some((w) => /first 3,000 groups/.test(w))).toBe(true);
+  });
+
+  it('drops oversized logos, URLs and header values so favorites stay small', () => {
+    const hugeLogo = `data:image/png;base64,${'A'.repeat(20000)}`;
+    const hugeAgent = 'x'.repeat(5000);
+    const text = [
+      '#EXTM3U',
+      `#EXTINF:-1 tvg-logo="${hugeLogo}" tvg-id="${'i'.repeat(1000)}" user-agent="${hugeAgent}",Big`,
+      `#EXTVLCOPT:http-referrer=${'r'.repeat(5000)}`,
+      'https://ok.test/a.m3u8',
+      '#EXTINF:-1,Long URL',
+      `https://x.test/${'p'.repeat(9000)}.m3u8`,
+    ].join('\n');
+    const { channels } = parseM3U(text);
+    expect(channels).toHaveLength(1);
+    const [ch] = channels;
+    expect(ch.logo).toBe('');
+    expect(ch.headers).toEqual({});
+    expect(ch.tvgId.length).toBeLessThanOrEqual(300);
+  });
+});

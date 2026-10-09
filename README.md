@@ -43,8 +43,10 @@ for **GitHub Pages**.
   | `S` | Star the current channel |
 
 - **Shareable links:**
-  - `?playlist=<url>` opens a playlist.
+  - `?playlist=<url>` opens a playlist you already have; an unknown playlist is added only after you confirm
+    the prompt.
   - `?play=<stream-url>&name=<title>` plays a single stream.
+  - Both are ignored when the app is embedded in another site's frame.
 
 ## Quick start
 
@@ -102,7 +104,17 @@ tests/                   Vitest unit tests
 .github/workflows/       GitHub Pages deployment
 ```
 
-## Privacy
+## Privacy & security
 
 Everything stays in your browser. There's no analytics, no account, and no backend. Playlists and streams
 are fetched directly from the URLs you provide.
+
+- Playlist content is untrusted. It is only ever rendered as text, so a channel name or logo can't run
+  script.
+- Logos are limited to `http(s)` and `data:image` URLs.
+- The production build ships a strict Content-Security-Policy: no inline scripts or styles, workers from the
+  app's own origin only.
+- To keep a hostile playlist from freezing the page or filling storage, the parser caps oversized names,
+  URLs, logos and headers, and keeps at most 3,000 groups.
+- Playlist downloads send no cookies.
+- Stream and playlist requests send only the app's origin as the referrer.
