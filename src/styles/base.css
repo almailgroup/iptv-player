@@ -129,6 +129,11 @@ mark,
   background: transparent;
 }
 
+/* The hidden attribute must always win over component display rules (.btn, .badge, …). */
+[hidden] {
+  display: none !important;
+}
+
 .visually-hidden {
   position: absolute !important;
   width: 1px;

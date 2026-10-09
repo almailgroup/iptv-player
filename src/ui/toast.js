@@ -6,14 +6,32 @@ import { icon } from './icons.js';
 const MAX_VISIBLE = 4;
 const TYPE_ICON = { info: 'info', success: 'check', warning: 'alert', error: 'alert' };
 
+function topModalDialog() {
+  const open = document.querySelectorAll('dialog[open]:not(.is-closing)');
+  for (let i = open.length - 1; i >= 0; i--) {
+    try {
+      if (open[i].matches(':modal')) return open[i];
+    } catch {
+      return open[i]; // engines without :modal support
+    }
+  }
+  return null;
+}
+
+function fullscreenHost() {
+  const el = document.fullscreenElement;
+  return el && !(el instanceof HTMLVideoElement) ? el : null;
+}
+
 function getContainer() {
   let el = document.getElementById('toasts');
   if (!el) {
     el = h('div', { id: 'toasts', class: 'toasts', 'aria-live': 'polite', 'aria-atomic': 'false' });
     document.body.append(el);
   }
-  // Toasts must render inside the fullscreen element to be visible while fullscreen.
-  const host = document.fullscreenElement || document.body;
+  // Toasts must render inside the top-most modal <dialog> (top layer) or the fullscreen element to be
+  // visible and clickable while either is showing.
+  const host = topModalDialog() || fullscreenHost() || document.body;
   if (el.parentElement !== host) host.append(el);
   return el;
 }
