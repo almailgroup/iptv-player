@@ -53,6 +53,8 @@ import { applyTheme } from '../ui/theme.js';
 import { toast } from '../ui/toast.js';
 
 const SESSION_DEBOUNCE_MS = 400;
+const LANE_ADD = 'add'; // adding a playlist: a newer add supersedes an older one
+const LANE_CONTENT = 'content'; // downloading the content of the playlist being shown
 const AUTO_REFRESH_DELAY_MS = 4000; // let the first stream start before re-downloading in the background
 const HOUR_MS = 3_600_000;
 const MAX_NAME_LENGTH = 120;
@@ -109,14 +111,18 @@ function cleanName(value) {
 // ---------------------------------------------------------------------------------------------------------
 // Sanitizers for persisted data (storage content may be stale, corrupt or written by another version)
 
+/** Numbers and numeric strings only (`Number(null)`, `Number(true)` and `Number('')` would be 0 / 1). */
+const toNumber = (value) =>
+  typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN;
+
 function coerceSetting(key, value) {
   const fallback = DEFAULT_SETTINGS[key];
   if (key === 'maxRetries') {
-    const n = Math.round(Number(value));
+    const n = Math.round(toNumber(value));
     return Number.isFinite(n) ? clamp(n, 1, 30) : undefined;
   }
   if (key === 'autoRefreshHours') {
-    const n = Number(value);
+    const n = toNumber(value);
     return Number.isFinite(n) && n >= 0 ? Math.min(n, 24 * 365) : undefined;
   }
   if (key === 'corsProxy') {
@@ -128,7 +134,7 @@ function coerceSetting(key, value) {
     if (typeof value === 'boolean') return value;
     return value === 0 || value === 1 ? value === 1 : undefined;
   }
-  if (typeof fallback === 'number') return Number.isFinite(Number(value)) ? Number(value) : undefined;
+  if (typeof fallback === 'number') return Number.isFinite(toNumber(value)) ? toNumber(value) : undefined;
   if (typeof fallback === 'string') return typeof value === 'string' ? value : undefined;
   return undefined;
 }
@@ -213,14 +219,51 @@ function sanitizePlaylists(raw) {
   return out;
 }
 
-/** Favorite/recent snapshots: objects with string id + url, deduped by id (first wins). */
+const SNAPSHOT_HEADERS = ['userAgent', 'referrer', 'origin'];
+const MAX_SNAPSHOT_GROUPS = 8;
+
+/**
+ * One stored favorite/recent snapshot with every field type-checked (the UI calls string methods on names,
+ * groups and logos, so a corrupt value must never get through). null when it has no string id + url.
+ */
+function sanitizeSnapshot(raw) {
+  if (!isObject(raw) || typeof raw.id !== 'string' || !raw.id) return null;
+  if (typeof raw.url !== 'string' || !raw.url.trim()) return null;
+  const text = (value) => (typeof value === 'string' ? value : '');
+  const snap = {
+    id: raw.id,
+    name: text(raw.name),
+    url: raw.url.trim(),
+    logo: text(raw.logo),
+    group: text(raw.group) || UNCATEGORIZED,
+    tvgId: text(raw.tvgId),
+    playlistId: typeof raw.playlistId === 'string' && raw.playlistId ? raw.playlistId : null,
+  };
+  if (Array.isArray(raw.groups)) {
+    const groups = [...new Set(raw.groups.filter((g) => typeof g === 'string' && g))];
+    if (groups.length > 1) snap.groups = groups.slice(0, MAX_SNAPSHOT_GROUPS);
+  }
+  if (isObject(raw.headers)) {
+    const headers = {};
+    for (const key of SNAPSHOT_HEADERS) {
+      if (typeof raw.headers[key] === 'string' && raw.headers[key]) headers[key] = raw.headers[key];
+    }
+    if (Object.keys(headers).length) snap.headers = headers;
+  }
+  if (raw.drm === true) snap.drm = true;
+  if (Number.isFinite(raw.addedAt)) snap.addedAt = raw.addedAt;
+  if (Number.isFinite(raw.watchedAt)) snap.watchedAt = raw.watchedAt;
+  return snap;
+}
+
+/** Favorite/recent snapshots: valid entries only (see sanitizeSnapshot), deduped by id (first wins). */
 function sanitizeSnapshots(raw) {
   if (!Array.isArray(raw)) return [];
   const seen = new Set();
   const out = [];
-  for (const snap of raw) {
-    if (!isObject(snap) || typeof snap.id !== 'string' || !snap.id) continue;
-    if (typeof snap.url !== 'string' || !snap.url || seen.has(snap.id)) continue;
+  for (const item of raw) {
+    const snap = sanitizeSnapshot(item);
+    if (!snap || seen.has(snap.id)) continue;
     seen.add(snap.id);
     out.push(snap);
   }
@@ -262,6 +305,8 @@ export function createInitialState() {
     recents,
     currentChannel: null,
     playRequest: 0,
+    // Player state ('idle' | 'loading' | 'playing' | …) published by the player view; never persisted.
+    playbackState: 'idle',
     theme,
     settings,
     volume: session.volume,
@@ -438,8 +483,9 @@ export function createController(store) {
   let applyingRemote = false; // true while applying another tab's change (don't write it back)
   let storageWarned = false;
   let intentSeq = 0; // bumped by every "show this playlist" intent; stale loads don't activate
-  let busySeq = 0;
-  let foreground = null; // AbortController of the in-flight user-initiated download
+  const busyStack = []; // messages of the running tasks; the newest one is shown
+  const lanes = new Map(); // lane -> AbortController of its in-flight task (a new task supersedes it)
+  const tasks = new Set(); // AbortControllers of every in-flight task
   const background = new Map(); // playlistId -> AbortController of a silent auto-refresh
   const autoRefreshTried = new Set();
   const timers = new Set();
@@ -470,7 +516,17 @@ export function createController(store) {
     volume: s.volume,
     muted: s.muted,
   });
-  const saveSession = debounce(() => save(KEYS.session, sessionOf(get())), SESSION_DEBOUNCE_MS);
+  // Only a pending change is flushed on pagehide / tab hide: an idle tab must not overwrite the session
+  // another tab saved in the meantime.
+  let sessionPending = false;
+  const writeSession = debounce(() => {
+    sessionPending = false;
+    save(KEYS.session, sessionOf(get()));
+  }, SESSION_DEBOUNCE_MS);
+  const saveSession = () => {
+    sessionPending = true;
+    writeSession();
+  };
   const SESSION_FIELDS = ['activePlaylistId', 'category', 'sort', 'groupSort', 'volume', 'muted'];
 
   cleanups.push(
@@ -500,13 +556,36 @@ export function createController(store) {
   );
 
   const flushSession = () => {
-    if (!disposed) saveSession.flush();
+    if (!disposed && sessionPending) writeSession.flush();
   };
   const onVisibilityChange = () => {
     if (document.visibilityState === 'hidden') flushSession();
   };
 
-  /** Another tab changed one of our keys: adopt favorites/recents/theme/settings (without writing back). */
+  /**
+   * Another tab saved its playlist list (added, renamed, removed…): adopt it, so a later write from this
+   * tab can't drop the other tab's playlists. When it removed the playlist shown here, move on like a local
+   * removal would.
+   */
+  function adoptRemotePlaylists(playlists) {
+    const s = get();
+    if (JSON.stringify(s.playlists) === JSON.stringify(playlists)) return;
+    const index = s.playlists.findIndex((p) => p.id === s.activePlaylistId);
+    for (const p of s.playlists) {
+      if (playlists.some((q) => q.id === p.id)) continue;
+      background.get(p.id)?.abort();
+      background.delete(p.id);
+    }
+    applyingRemote = true;
+    try {
+      if (index === -1 || playlists.some((p) => p.id === s.activePlaylistId)) store.set({ playlists });
+      else leaveRemovedPlaylist(playlists, index);
+    } finally {
+      applyingRemote = false;
+    }
+  }
+
+  /** Another tab changed one of our keys: adopt favorites/recents/theme/settings/playlists (no write-back). */
   const onStorage = (e) => {
     if (disposed || !e.key) return;
     try {
@@ -529,6 +608,9 @@ export function createController(store) {
     } else if (e.key === KEYS.settings) {
       key = 'settings';
       value = sanitizeSettings(readJSON(KEYS.settings, null));
+    } else if (e.key === KEYS.playlists) {
+      adoptRemotePlaylists(sanitizePlaylists(readJSON(KEYS.playlists, null)));
+      return;
     } else return;
     if (JSON.stringify(s[key]) === JSON.stringify(value)) return;
     applyingRemote = true;
@@ -553,10 +635,13 @@ export function createController(store) {
   // ---- Busy state & download tasks ------------------------------------------------------------------------
 
   function beginBusy(message) {
-    const token = ++busySeq;
-    store.set({ busy: { message } });
+    const entry = { message };
+    busyStack.push(entry);
+    store.set({ busy: entry });
     return () => {
-      if (token === busySeq) store.set({ busy: null });
+      const index = busyStack.indexOf(entry);
+      if (index !== -1) busyStack.splice(index, 1);
+      store.set({ busy: busyStack.at(-1) || null });
     };
   }
 
@@ -568,13 +653,15 @@ export function createController(store) {
   }
 
   /**
-   * Run a user-initiated task that may download: aborts the previous one, shows the busy indicator and
-   * toasts failures (except cancellations). Rejects with a friendly error.
+   * Run a task that may download: shows the busy indicator and toasts failures (except cancellations).
+   * Rejects with a friendly error. A new task aborts the in-flight one of the same `lane` only — adding a
+   * playlist must not cancel the download of the playlist on screen (that would leave it empty).
    */
-  async function runTask(message, task, { onError } = {}) {
-    foreground?.abort();
+  async function runTask(message, task, { onError, lane } = {}) {
+    if (lane) lanes.get(lane)?.abort();
     const controller = new AbortController();
-    foreground = controller;
+    if (lane) lanes.set(lane, controller);
+    tasks.add(controller);
     const endBusy = beginBusy(message);
     try {
       return await task(controller.signal);
@@ -586,9 +673,15 @@ export function createController(store) {
       }
       throw error;
     } finally {
-      if (foreground === controller) foreground = null;
+      if (lane && lanes.get(lane) === controller) lanes.delete(lane);
+      tasks.delete(controller);
       endBusy();
     }
+  }
+
+  function abortAll() {
+    for (const controller of tasks) controller.abort();
+    for (const controller of background.values()) controller.abort();
   }
 
   function later(fn, ms) {
@@ -610,7 +703,9 @@ export function createController(store) {
       result = null;
     }
     if (result?.ok) return true;
-    removePlaylistText(id);
+    // Drop a stale stored copy. Without localStorage at all, the in-memory copy the storage module kept is
+    // the only one this session has (e.g. to switch back to an uploaded file), so it stays.
+    if (isStorageAvailable()) removePlaylistText(id);
     if (warn && source.kind !== 'demo') {
       const unavailable = result?.error === 'UNAVAILABLE';
       if (source.kind === 'file') toast.warning(unavailable ? MSG.cacheUnavailableFile : MSG.cacheFile);
@@ -720,6 +815,33 @@ export function createController(store) {
       const channel = selectChannelMap(get()).get(id) || findSnapshotChannel(id);
       if (channel) play(channel, { record: false });
     }
+  }
+
+  /**
+   * The active playlist was removed (here or in another tab): show the one that took its place in
+   * `playlists` (the list without it; `index` = its old position), or the empty library.
+   */
+  function leaveRemovedPlaylist(playlists, index) {
+    const s = get();
+    if (pendingRestore?.playlistId === s.activePlaylistId) pendingRestore = null;
+    const next = playlists[Math.min(index, playlists.length - 1)] || null;
+    if (next) {
+      // Keep the old list on screen for the few ms until the next playlist's content is ready.
+      store.set({ playlists, activePlaylistId: next.id, playlistError: null });
+      activate(next, { resetView: true }).catch(noop);
+      return;
+    }
+    beginActivation(null);
+    const keepCategory = s.category === CATEGORY.favorites || s.category === CATEGORY.recent;
+    store.set({
+      playlists,
+      activePlaylistId: null,
+      channels: [],
+      groups: [],
+      playlistError: null,
+      category: keepCategory ? s.category : CATEGORY.all,
+      query: '',
+    });
   }
 
   /** A new "show this playlist" intent; drops a pending restore that belongs to another playlist. */
@@ -882,7 +1004,7 @@ export function createController(store) {
     if (!current) return;
 
     if (parsed) {
-      const cached = current.source.kind === 'demo' ? current.cached : true;
+      const cached = current.source.kind === 'demo' ? current.cached : isStorageAvailable();
       showPlaylist(syncMeta(current, parsed, { cached }), parsed, { resetView });
       scheduleAutoRefresh(findPlaylist(meta.id));
       return;
@@ -904,7 +1026,7 @@ export function createController(store) {
     await runTask(
       `Downloading “${current.name}”…`,
       (signal) => downloadInto(current.id, { signal, silent: true }),
-      { onError: (error) => onActiveLoadError(current.id, error) },
+      { onError: (error) => onActiveLoadError(current.id, error), lane: LANE_CONTENT },
     );
   }
 
@@ -1007,7 +1129,7 @@ export function createController(store) {
       const current = findPlaylist(target.id);
       if (intent === intentSeq && current) {
         if (parsed) {
-          const cached = current.source.kind === 'demo' ? current.cached : true;
+          const cached = current.source.kind === 'demo' ? current.cached : isStorageAvailable();
           showPlaylist(syncMeta(current, parsed, { cached }), parsed, { resetView: false });
           shown = true;
         } else {
@@ -1060,13 +1182,17 @@ export function createController(store) {
         throw report(err);
       }
       const intent = beginActivation(null);
-      return runTask('Downloading playlist…', async (signal) => {
-        const result = await fetchPlaylist(normalized, { signal, corsProxy: get().settings.corsProxy });
-        throwIfAborted(signal);
-        // Remember the https:// form when the loader had to upgrade an http:// link on an https page.
-        const sourceUrl = result.upgraded ? normalized.replace(/^http:/i, 'https:') : normalized;
-        return ingest(result.text, { name, source: { kind: 'url', url: sourceUrl }, signal, intent });
-      });
+      return runTask(
+        'Downloading playlist…',
+        async (signal) => {
+          const result = await fetchPlaylist(normalized, { signal, corsProxy: get().settings.corsProxy });
+          throwIfAborted(signal);
+          // Remember the https:// form when the loader had to upgrade an http:// link on an https page.
+          const sourceUrl = result.upgraded ? normalized.replace(/^http:/i, 'https:') : normalized;
+          return ingest(result.text, { name, source: { kind: 'url', url: sourceUrl }, signal, intent });
+        },
+        { lane: LANE_ADD },
+      );
     },
 
     /** Read, parse, persist and activate an uploaded/dropped playlist file. */
@@ -1074,12 +1200,16 @@ export function createController(store) {
       if (!file || typeof file !== 'object') throw report(new Error('No playlist file was selected.'));
       const intent = beginActivation(null);
       const fileName = typeof file.name === 'string' && file.name.trim() ? file.name.trim() : '';
-      return runTask(fileName ? `Reading “${fileName}”…` : 'Reading playlist…', async (signal) => {
-        const text = await readPlaylistFile(file);
-        throwIfAborted(signal);
-        const source = fileName ? { kind: 'file', fileName } : { kind: 'file' };
-        return ingest(text, { name, source, signal, intent });
-      });
+      return runTask(
+        fileName ? `Reading “${fileName}”…` : 'Reading playlist…',
+        async (signal) => {
+          const text = await readPlaylistFile(file);
+          throwIfAborted(signal);
+          const source = fileName ? { kind: 'file', fileName } : { kind: 'file' };
+          return ingest(text, { name, source, signal, intent });
+        },
+        { lane: LANE_ADD },
+      );
     },
 
     /** Ingest playlist text directly (`source` defaults to a file source). */
@@ -1087,7 +1217,9 @@ export function createController(store) {
       if (typeof text !== 'string' || !text.trim()) throw report(new Error(MSG.empty));
       const src = sanitizeSource(source) || { kind: 'file' };
       const intent = beginActivation(null);
-      return runTask('Loading playlist…', (signal) => ingest(text, { name, source: src, signal, intent }));
+      return runTask('Loading playlist…', (signal) => ingest(text, { name, source: src, signal, intent }), {
+        lane: LANE_ADD,
+      });
     },
 
     /** Add (or re-open) the built-in demo playlist. */
@@ -1127,6 +1259,7 @@ export function createController(store) {
             if (get().activePlaylistId === id) onActiveLoadError(id, error);
             else toast.error(error.message);
           },
+          lane: `refresh:${id}`,
         },
       );
     },
@@ -1152,25 +1285,7 @@ export function createController(store) {
         store.set({ playlists });
         return;
       }
-      if (pendingRestore?.playlistId === id) pendingRestore = null;
-      const next = playlists[Math.min(index, playlists.length - 1)] || null;
-      if (next) {
-        // Keep the old list on screen for the few ms until the next playlist's content is ready.
-        store.set({ playlists, activePlaylistId: next.id, playlistError: null });
-        activate(next, { resetView: true }).catch(noop);
-      } else {
-        beginActivation(null);
-        const keepCategory = s.category === CATEGORY.favorites || s.category === CATEGORY.recent;
-        store.set({
-          playlists,
-          activePlaylistId: null,
-          channels: [],
-          groups: [],
-          playlistError: null,
-          category: keepCategory ? s.category : CATEGORY.all,
-          query: '',
-        });
-      }
+      leaveRemovedPlaylist(playlists, index);
     },
 
     /** Download a playlist as .m3u (stored text; re-downloaded when it isn't cached). */
@@ -1329,9 +1444,8 @@ export function createController(store) {
     /** Wipe all of our localStorage keys and reload the page. */
     clearAllData() {
       disposed = true;
-      saveSession.cancel();
-      foreground?.abort();
-      for (const controller of background.values()) controller.abort();
+      writeSession.cancel();
+      abortAll();
       clearStoredData();
       try {
         globalThis.location.reload();
@@ -1342,11 +1456,10 @@ export function createController(store) {
 
     /** Flush pending writes and remove every listener/timer (tests, hot reload). */
     destroy() {
-      if (!disposed) saveSession.flush();
+      flushSession();
       disposed = true;
-      saveSession.cancel();
-      foreground?.abort();
-      for (const controller of background.values()) controller.abort();
+      writeSession.cancel();
+      abortAll();
       background.clear();
       for (const timer of timers) clearTimeout(timer);
       timers.clear();

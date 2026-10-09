@@ -295,6 +295,67 @@ describe('createInitialState', () => {
     expect(state.activePlaylistId).toBe('pl_seed'); // falls back to the first playlist
     expect(state).toMatchObject({ ready: false, busy: null, channels: [], currentChannel: null, playRequest: 0 });
   });
+
+  it('starts with playbackState "idle" and never persists it', async () => {
+    vi.useFakeTimers();
+    const { store, actions } = setup();
+    expect(store.get().playbackState).toBe('idle');
+    store.set({ playbackState: 'playing' });
+    actions.setSort('name');
+    await vi.advanceTimersByTimeAsync(1000);
+    window.dispatchEvent(new Event('pagehide'));
+    expect(lastWrite(KEYS.session)).not.toHaveProperty('playbackState');
+    for (const [, value] of storage.writeJSON.mock.calls) expect(JSON.stringify(value)).not.toContain('playbackState');
+  });
+
+  it('ignores null / boolean / empty-string numbers in stored settings', () => {
+    mem.json.set(KEYS.settings, { maxRetries: null, autoRefreshHours: true, autoplay: false });
+    expect(createInitialState().settings).toEqual({ ...DEFAULT_SETTINGS, autoplay: false });
+    mem.json.set(KEYS.settings, { maxRetries: '', autoRefreshHours: '' });
+    expect(createInitialState().settings).toEqual(DEFAULT_SETTINGS);
+    mem.json.set(KEYS.settings, { maxRetries: '12', autoRefreshHours: '6' });
+    expect(createInitialState().settings).toMatchObject({ maxRetries: 12, autoRefreshHours: 6 });
+  });
+
+  it('type-checks every field of stored favorites / recents snapshots', () => {
+    mem.json.set(KEYS.favorites, [
+      {
+        id: 'a',
+        url: ' https://x/a.m3u8 ',
+        name: ['not', 'a', 'string'],
+        logo: { src: 'x' },
+        group: 7,
+        groups: [1, null, 'News', 'News', 'World'],
+        headers: { userAgent: 'UA', referrer: 5, evil: 'x' },
+        tvgId: 9,
+        drm: 'yes',
+        playlistId: 3,
+        addedAt: 'today',
+      },
+      { id: 'b', url: 'https://x/b', name: 'B', headers: 'zz', groups: 'abc', drm: true, addedAt: 5 },
+      { id: 'c', url: 42 },
+      { id: 'd', url: '   ' },
+    ]);
+    mem.json.set(KEYS.recents, [{ id: 'r', url: 'https://x/r', name: { x: 1 }, watchedAt: 9 }, 'junk', null]);
+    const state = createInitialState();
+    expect(state.favorites).toEqual([
+      {
+        id: 'a',
+        name: '',
+        url: 'https://x/a.m3u8',
+        logo: '',
+        group: UNCATEGORIZED,
+        groups: ['News', 'World'],
+        headers: { userAgent: 'UA' },
+        tvgId: '',
+        playlistId: null,
+      },
+      { id: 'b', name: 'B', url: 'https://x/b', logo: '', group: UNCATEGORIZED, tvgId: '', playlistId: null, drm: true, addedAt: 5 },
+    ]);
+    expect(state.recents).toEqual([
+      { id: 'r', name: '', url: 'https://x/r', logo: '', group: UNCATEGORIZED, tvgId: '', playlistId: null, watchedAt: 9 },
+    ]);
+  });
 });
 
 describe('ingest', () => {
@@ -397,6 +458,47 @@ describe('ingest', () => {
     expect(toast.success).toHaveBeenCalledTimes(2); // still loaded for this session
   });
 
+  it('keeps the in-memory copy of a playlist when browser storage is unavailable', async () => {
+    storage.isStorageAvailable.mockReturnValue(false);
+    // The storage module falls back to memory: the text is kept for this session but `ok` is false.
+    storage.writePlaylistText.mockImplementation(async (id, text) => {
+      mem.text.set(id, text);
+      return { ok: false, bytes: 0, compressed: false, error: 'UNAVAILABLE' };
+    });
+    try {
+      const { store, actions } = setup();
+      const first = await actions.addPlaylistFromFile(new File([SAMPLE], 'first.m3u'));
+      expect(toast.warning).toHaveBeenLastCalledWith(expect.stringContaining('Browser storage is unavailable'));
+      await actions.addPlaylistFromFile(new File([m3u(ENTRIES.slice(0, 2), 'Second')], 'second.m3u'));
+      expect(storage.removePlaylistText).not.toHaveBeenCalled();
+
+      await actions.switchPlaylist(first.id); // must not fail with "no longer stored"
+      expect(store.get()).toMatchObject({ activePlaylistId: first.id, playlistError: null });
+      expect(store.get().channels).toHaveLength(4);
+      expect(store.get().playlists.find((p) => p.id === first.id).cached).toBe(false);
+      expect(toast.error).not.toHaveBeenCalled();
+    } finally {
+      storage.isStorageAvailable.mockReturnValue(true);
+      storage.writePlaylistText.mockReset();
+      storage.writePlaylistText.mockImplementation(async (id, text) => {
+        if (mem.failWrite) return { ok: false, bytes: 0, compressed: false, error: mem.failWrite };
+        mem.text.set(id, text);
+        return { ok: true, bytes: text.length * 2, compressed: false };
+      });
+    }
+  });
+
+  it('drops a stale stored copy when a write fails although storage is available', async () => {
+    respondWith();
+    const { actions } = setup();
+    const meta = await actions.addPlaylistFromUrl({ url: URL_A });
+    expect(mem.text.has(meta.id)).toBe(true);
+    mem.failWrite = 'UNAVAILABLE'; // e.g. a SecurityError on setItem
+    await actions.refreshPlaylist(meta.id);
+    expect(storage.removePlaylistText).toHaveBeenCalledWith(meta.id);
+    expect(mem.text.has(meta.id)).toBe(false);
+  });
+
   it('appends the first parser warning to the success toast', async () => {
     respondWith(m3u([...ENTRIES, ['Old', 'News', 'rtmp://live.example/app', '']]));
     const { actions } = setup();
@@ -426,6 +528,30 @@ describe('ingest', () => {
     expect(toast.error).not.toHaveBeenCalled();
     expect(store.get().playlists.map((p) => p.source.url)).toEqual([URL_B]);
     expect(store.get()).toMatchObject({ activePlaylistId: meta.id, busy: null });
+  });
+
+  it('adding a playlist does not cancel the download of the playlist on screen', async () => {
+    seedPlaylist({ text: null, cached: false }); // active URL playlist that has to be downloaded
+    let release;
+    fetchPlaylist.mockImplementation((url, { signal }) => {
+      if (url !== URL_A) return Promise.reject(new PlaylistLoadError('HTTP', 'nope', { status: 404 }));
+      return new Promise((resolve, reject) => {
+        release = () => resolve(okResult(SAMPLE, url));
+        signal.addEventListener('abort', () => reject(new PlaylistLoadError('ABORTED', 'aborted')));
+      });
+    });
+    const { store, actions } = setup();
+    const init = actions.init();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const downloading = store.get().busy;
+    expect(downloading).toEqual({ message: 'Downloading “Seeded”…' });
+
+    await expect(actions.addPlaylistFromUrl({ url: URL_B })).rejects.toMatchObject({ code: 'HTTP' });
+    expect(store.get().busy).toBe(downloading); // the first download is still running
+    release();
+    await init;
+    expect(store.get()).toMatchObject({ activePlaylistId: 'pl_seed', playlistError: null, busy: null });
+    expect(store.get().channels).toHaveLength(4);
   });
 
   it('adds the demo playlist once', async () => {
@@ -582,6 +708,23 @@ describe('persistence', () => {
     expect(lastWrite(KEYS.session).category).toBe('group:Sports');
   });
 
+  it('does not rewrite an unchanged session when the tab is hidden or closed', async () => {
+    vi.useFakeTimers();
+    respondWith();
+    const { store, actions } = setup();
+    await actions.addPlaylistFromUrl({ url: URL_A });
+    await vi.advanceTimersByTimeAsync(1000);
+    // Another tab saves its own session meanwhile; this idle tab must not overwrite it.
+    mem.json.set(KEYS.session, { activePlaylistId: 'pl_other_tab' });
+    storage.writeJSON.mockClear();
+    window.dispatchEvent(new Event('pagehide'));
+    document.dispatchEvent(new Event('visibilitychange'));
+    actions.destroy();
+    expect(writesFor(KEYS.session)).toHaveLength(0);
+    expect(mem.json.get(KEYS.session)).toEqual({ activePlaylistId: 'pl_other_tab' });
+    expect(store.get().activePlaylistId).not.toBe('pl_other_tab');
+  });
+
   it('writes settings and theme immediately and applies the theme', () => {
     const { store, actions } = setup();
     actions.updateSettings({ maxRetries: 0, autoplay: false, corsProxy: ' https://proxy.example/?url= ', nope: 1 });
@@ -607,10 +750,38 @@ describe('persistence', () => {
     window.dispatchEvent(new StorageEvent('storage', { key: KEYS.favorites, newValue: JSON.stringify([snap]) }));
     window.dispatchEvent(new StorageEvent('storage', { key: KEYS.theme, newValue: '{}' }));
 
-    expect(store.get().favorites).toEqual([snap]);
+    expect(store.get().favorites).toEqual([{ ...snap, logo: '', tvgId: '', playlistId: null }]);
     expect(store.get().theme).toEqual({ accent: 'violet', mode: 'dark' });
     expect(applyTheme).toHaveBeenLastCalledWith({ accent: 'violet', mode: 'dark' });
     expect(storage.writeJSON).not.toHaveBeenCalled();
+  });
+
+  it('adopts the playlist list saved by another tab, so its playlists are never overwritten', async () => {
+    respondWith((url) => (url === URL_B ? m3u(ENTRIES.slice(0, 1), 'Other') : SAMPLE));
+    const { store, actions } = setup();
+    const mine = await actions.addPlaylistFromUrl({ url: URL_A });
+    const remote = { ...mine, id: 'pl_remote', name: 'From the other tab', source: { kind: 'url', url: URL_B } };
+    mem.text.set('pl_remote', m3u(ENTRIES.slice(0, 1), 'Other'));
+    const sync = (list) => {
+      mem.json.set(KEYS.playlists, list);
+      storage.writeJSON.mockClear();
+      window.dispatchEvent(new StorageEvent('storage', { key: KEYS.playlists, newValue: JSON.stringify(list) }));
+    };
+
+    sync([mine, remote]);
+    expect(store.get().playlists.map((p) => p.id)).toEqual([mine.id, 'pl_remote']);
+    expect(writesFor(KEYS.playlists)).toHaveLength(0); // adopted, not written back
+    actions.renamePlaylist(mine.id, 'Renamed here');
+    expect(lastWrite(KEYS.playlists).map((p) => p.name)).toEqual(['Renamed here', 'From the other tab']);
+
+    // The other tab deletes the playlist shown here → this tab moves on to the remaining one.
+    sync([remote]);
+    expect(store.get().activePlaylistId).toBe('pl_remote');
+    await vi.waitFor(() => expect(store.get().channels.map((c) => c.name)).toEqual(['News One']));
+    expect(storage.removePlaylistText).not.toHaveBeenCalled(); // the other tab already did
+
+    sync([]); // e.g. "Clear all data" in the other tab
+    expect(store.get()).toMatchObject({ playlists: [], activePlaylistId: null, channels: [] });
   });
 
   it('clearAllData wipes storage, stops persisting and reloads', () => {

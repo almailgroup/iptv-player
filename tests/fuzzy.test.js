@@ -268,6 +268,27 @@ describe('searchChannels', () => {
     expect(names(searchChannels(list, 'bbc one'))).toEqual(['BBC One', 'One BBC Show']);
   });
 
+  it('ranks realistic channel names sensibly', () => {
+    const list = [
+      ['BBC One HD', 'UK'], ['BBC One London', 'UK'], ['BBC Two HD', 'UK'], ['BBC News HD', 'UK News'],
+      ['CBBC', 'Kids'], ['CNN', 'News'], ['CNN International', 'News'], ['CNBC', 'Business'],
+      ['Cartoon Network', 'Kids'], ['ESPN', 'Sports'], ['ESPN 2', 'Sports'], ['ESPN2 HD', 'Sports'],
+      ['ESPNews', 'Sports'], ['Fox Sports 1', 'Sports'], ['FOX Sports Racing', 'Sports'], ['Fox News Channel', 'News'],
+      ['Fox Soccer Plus', 'Sports'], ['TF1', 'France'], ['TF1 Séries Films', 'France'], ['TFX', 'France'],
+      ['RTL', 'Germany'], ['RTL Zwei', 'Germany'], ['Super RTL', 'Germany'], ['Sky Sports F1', 'UK Sports'],
+    ].map(([name, group]) => ch(name, { groups: [group] }));
+    const top = (q, n) => names(searchChannels(list, q)).slice(0, n);
+    expect(top('bbc one hd', 2)).toEqual(['BBC One HD']);
+    expect(top('bbc one', 2)).toEqual(['BBC One HD', 'BBC One London']);
+    expect(top('cnn', 3)).toEqual(['CNN', 'CNN International', 'Cartoon Network']);
+    expect(top('espn 2', 2)).toEqual(['ESPN 2', 'ESPN2 HD']);
+    expect(top('fox sports', 3)).toEqual(['Fox Sports 1', 'FOX Sports Racing', 'Fox Soccer Plus']);
+    expect(top('tf1', 3)).toEqual(['TF1', 'TF1 Séries Films', 'Sky Sports F1']);
+    expect(top('rtl', 3)).toEqual(['RTL', 'RTL Zwei', 'Super RTL']);
+    expect(top('series films', 1)).toEqual(['TF1 Séries Films']); // diacritic-insensitive
+    expect(names(searchChannels(list, 'espn')).slice(0, 5)).toEqual(['ESPN', 'ESPN 2', 'ESPN2 HD', 'ESPNews']);
+  });
+
   it('searches 20k channels with a 6-char query quickly', () => {
     const words = ['news', 'sport', 'movie', 'cinema', 'kids', 'music', 'docu', 'discovery', 'channel', 'hd',
       'uk', 'us', 'de', 'plus', 'one', 'max', 'live', 'world', 'family', 'action', 'comedy', 'drama'];

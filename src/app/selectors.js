@@ -21,21 +21,22 @@ function memo(fn) {
 
 /** Convert a stored favorite/recent snapshot into a Channel-shaped object. */
 export function snapshotToChannel(snap) {
-  const group = snap.group || UNCATEGORIZED;
+  const text = (value) => (typeof value === 'string' ? value : '');
+  const group = text(snap.group) || UNCATEGORIZED;
   return {
     id: snap.id,
     index: -1,
-    name: snap.name || 'Untitled',
+    name: text(snap.name) || 'Untitled',
     url: snap.url,
     group,
     groups: Array.isArray(snap.groups) && snap.groups.length ? snap.groups : [group],
-    logo: snap.logo || '',
-    tvgId: snap.tvgId || '',
+    logo: text(snap.logo),
+    tvgId: text(snap.tvgId),
     tvgName: '',
     chno: null,
     duration: -1,
     attrs: {},
-    headers: snap.headers || {},
+    headers: snap.headers && typeof snap.headers === 'object' ? snap.headers : {},
     drm: !!snap.drm,
     playlistId: snap.playlistId || null,
   };
@@ -90,28 +91,27 @@ export const selectSortedGroups = (state) => sortedGroups(state.groups, state.gr
 
 const resolveSnapshots = (snaps, map) => snaps.map((s) => map.get(s.id) || snapshotToChannel(s));
 
-const categoryChannels = memo((channels, favorites, recents, category, sort, map) => {
-  let list;
-  if (category === CATEGORY.favorites) list = resolveSnapshots(favorites, map);
-  else if (category === CATEGORY.recent) return resolveSnapshots(recents, map); // always most-recent first
-  else if (category.startsWith(CATEGORY.groupPrefix)) {
-    const name = category.slice(CATEGORY.groupPrefix.length);
-    list = channels.filter((ch) => ch.groups.includes(name));
-  } else list = channels;
+// Each step is memoized on its own inputs only, so e.g. playing a channel (new recents) or starring one (new
+// favorites) doesn't re-sort and re-search a 20k-channel "All channels" list.
+const favoriteChannels = memo(resolveSnapshots);
+const recentChannels = memo(resolveSnapshots);
+const groupMembers = memo((channels, name) => channels.filter((ch) => ch.groups.includes(name)));
+const sortedChannels = memo((list, sort) =>
+  sort === 'name' ? list.slice().sort((a, b) => naturalCompare(a.name, b.name)) : list,
+);
 
-  if (sort === 'name') list = list.slice().sort((a, b) => naturalCompare(a.name, b.name));
-  return list;
-});
 /** Channels in the current category (before search), sorted per state.sort. */
-export const selectCategoryChannels = (state) =>
-  categoryChannels(
-    state.channels,
-    state.favorites,
-    state.recents,
-    state.category,
-    state.sort,
-    selectChannelMap(state),
-  );
+export function selectCategoryChannels(state) {
+  const { category } = state;
+  // "Recently watched" is always most-recent first.
+  if (category === CATEGORY.recent) return recentChannels(state.recents, selectChannelMap(state));
+  let list;
+  if (category === CATEGORY.favorites) list = favoriteChannels(state.favorites, selectChannelMap(state));
+  else if (category.startsWith(CATEGORY.groupPrefix)) {
+    list = groupMembers(state.channels, category.slice(CATEGORY.groupPrefix.length));
+  } else list = state.channels;
+  return sortedChannels(list, state.sort);
+}
 
 const visible = memo((list, query) => {
   const q = query.trim();

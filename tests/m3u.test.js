@@ -859,6 +859,112 @@ describe('serializeM3U', () => {
   });
 });
 
+describe('parseM3U — messy real-world playlists', () => {
+  it('parses a typical provider export with catch-up, Xtream links, glued attributes and odd spacing', () => {
+    const text = [
+      '#EXTM3U url-tvg="http://epg.example/a.xml.gz,http://epg.example/b.xml" tvg-shift=0 m3u-autoload=1',
+      '#EXTINF:-1 tvg-id="BBCOne.uk" tvg-name="BBC One HD" tvg-logo="https://i.example/x.png" group-title="UK | Entertainment",BBC One HD',
+      'http://example.com:8080/live/user/pass/1234.ts',
+      '#EXTINF:-1 tvg-id="" tvg-name="" tvg-logo="" group-title="",',
+      'http://example.com:8080/user/pass/1235',
+      '#EXTINF:-1 catchup="default" catchup-days="7" catchup-source="http://x/ts/{utc},{duration}" tvg-id="cnn.us" group-title="News",CNN International',
+      'https://cnn.example/live/master.m3u8',
+      "#EXTINF:-1 tvg-name='Single Q' group-title='Docs',Nat Geo",
+      'http://ng.example/stream.m3u8',
+      '#extinf:-1 TVG-ID="espn2.us" Group-Title="Sports;USA Sports",ESPN 2',
+      '  http://espn.example/2.m3u8  ',
+      '#EXTINF: -1 tvg-chno=7 group-title=News,Seven News',
+      'http://seven.example/index.m3u8',
+      '#EXTINF:-1 tvg-id="a" tvg-name="b"group-title="c",Glued Attrs',
+      'http://glued.example/x.m3u8',
+      '#EXTINF:-1 tvg-id="x" ,Space Before Comma',
+      'http://space.example/x.m3u8',
+      '#EXTINF:-1 tvg-id="z",Title, with, commas',
+      'http://commas.example/x.m3u8',
+      '#EXTINF:-1 tvg-id="tab"\tgroup-title="Tab\tGroup",\tTab Title',
+      'http://tab.example/x.m3u8',
+    ].join('\r\n');
+    const { channels, meta, warnings } = parseM3U(text);
+    channels.forEach((ch, i) => expectChannelShape(ch, i));
+    expect(meta.epgUrl).toBe('http://epg.example/a.xml.gz');
+    expect(warnings).toEqual([]);
+    expect(channels.map((c) => [c.name, c.groups])).toEqual([
+      ['BBC One HD', ['UK | Entertainment']],
+      ['1235', [UNCATEGORIZED]],
+      ['CNN International', ['News']],
+      ['Nat Geo', ['Docs']],
+      ['ESPN 2', ['Sports', 'USA Sports']],
+      ['Seven News', ['News']],
+      ['Glued Attrs', ['c']],
+      ['Space Before Comma', [UNCATEGORIZED]],
+      ['Title, with, commas', [UNCATEGORIZED]],
+      ['Tab Title', ['Tab Group']],
+    ]);
+    expect(channels[2].attrs['catchup-source']).toBe('http://x/ts/{utc},{duration}');
+    expect(channels[3].tvgName).toBe('Single Q');
+    expect(channels[4]).toMatchObject({ tvgId: 'espn2.us', url: 'http://espn.example/2.m3u8' });
+    expect(channels[5].chno).toBe(7);
+    expect(channels[6]).toMatchObject({ tvgId: 'a', tvgName: 'b' });
+  });
+
+  it('copes with broken quotes, entities, emoji, missing commas and stacked directives', () => {
+    const text = m3u(
+      '#EXTM3U',
+      '#EXTINF:-1 tvg-name="Broken,Title',
+      'http://broken.example/x.m3u8',
+      '#EXTINF:-1,AT&amp;T SportsNet &#8211; Pittsburgh',
+      'http://att.example/x.m3u8',
+      '#EXTINF:-1,🇫🇷 TF1 HD',
+      'http://tf1.example/x.m3u8',
+      '#EXTINF:-1 tvg-logo="http://logo.example/a.png?x=1&amp;y=2" group-title="Kids &amp; Family",Cartoon',
+      '#EXTVLCOPT:http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      '#EXTVLCOPT:http-referrer=https://ref.example/',
+      'http://kids.example/x.m3u8|User-Agent=VLC',
+      '#EXTINF:-1 tvg-id="ok.us" ESPN Deportes',
+      'http://nocomma.example/x.m3u8',
+      '#EXTINF:-1,He said "hi"',
+      'http://quotes.example/x.m3u8',
+      '#EXTINF:10.5,VOD Movie (2020)',
+      'http://vod.example/movie.mp4',
+      'Please visit our website for more channels!',
+      '#EXTINF:-1,Orphan without URL',
+      '#EXTINF:-1,Udp',
+      'udp://@239.0.0.1:1234',
+    );
+    const { channels, warnings } = parseM3U(text);
+    channels.forEach((ch, i) => expectChannelShape(ch, i));
+    expect(channels.map((c) => c.name)).toEqual([
+      'Title',
+      'AT&T SportsNet – Pittsburgh',
+      '🇫🇷 TF1 HD',
+      'Cartoon',
+      'ESPN Deportes',
+      'He said "hi"',
+      'VOD Movie (2020)',
+      'Udp',
+    ]);
+    expect(channels[0].tvgName).toBe('Broken');
+    expect(channels[3]).toMatchObject({
+      logo: 'http://logo.example/a.png?x=1&y=2',
+      groups: ['Kids & Family'],
+      headers: { userAgent: 'VLC', referrer: 'https://ref.example/' },
+      url: 'http://kids.example/x.m3u8',
+    });
+    expect(channels[6].duration).toBe(10.5);
+    expect(channels[7].url).toBe('udp://@239.0.0.1:1234');
+    expect(warnings).toEqual([
+      '1 channel uses a protocol browsers can’t play (udp://).',
+      'Skipped 1 line that isn’t a valid stream URL.',
+      'Skipped 1 entry without a stream URL.',
+    ]);
+    // Exports of messy input re-import to the same channels.
+    const again = parseM3U(serializeM3U(channels)).channels;
+    expect(again.map((c) => [c.id, c.url, c.groups, c.logo, c.headers])).toEqual(
+      channels.map((c) => [c.id, c.url, c.groups, c.logo, c.headers]),
+    );
+  });
+});
+
 describe('robustness and performance', () => {
   it('scans hostile attribute soup in linear time (no catastrophic backtracking)', () => {
     const soup = 'a="'.repeat(20000) + "b='".repeat(20000) + '=,'.repeat(20000) + ' x'.repeat(20000);
