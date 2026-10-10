@@ -248,7 +248,7 @@ export function openModal(options = {}) {
   }
 
   function finalize() {
-    if (entry.state === 'closed') return;
+    if (entry.state === 'closed' || typeof document === 'undefined') return; // page already torn down
     entry.state = 'closed';
     clearTimeout(exitTimer);
     const index = stack.indexOf(entry);

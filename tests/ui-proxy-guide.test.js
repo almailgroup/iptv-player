@@ -82,6 +82,10 @@ beforeEach(() => {
 afterEach(async () => {
   for (const handle of openHandles.splice(0)) handle.close();
   await new Promise((resolve) => setTimeout(resolve, 0));
+  // Let closing dialogs finish their exit animation, so no timer outlives the test environment.
+  for (let i = 0; i < 50 && document.querySelector('dialog'); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   window.happyDOM?.setURL('http://localhost:3000/');
