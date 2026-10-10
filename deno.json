@@ -1,0 +1,9 @@
+{
+  "lock": false,
+  "deploy": {
+    "runtime": {
+      "type": "dynamic",
+      "entrypoint": "./proxy/deno.js"
+    }
+  }
+}
