@@ -55,7 +55,7 @@ export function normalizeBuiltinRelay(value, warn) {
  * "off" to disable it); an empty/unset variable keeps DEFAULT_BUILTIN_RELAY. Both are checked with
  * normalizeBuiltinRelay(): an unusable value means no built-in relay (and a console warning).
  */
-const DEFAULT_BUILTIN_RELAY = '';
+const DEFAULT_BUILTIN_RELAY = 'https://iptv-player-56eab5bpcqzs.almailgroup.deno.net';
 const ENV_RELAY = String(import.meta.env?.VITE_BUILTIN_RELAY ?? '').trim();
 export const BUILTIN_RELAY_URL = normalizeBuiltinRelay(ENV_RELAY || DEFAULT_BUILTIN_RELAY, (message) =>
   console.warn(`[${APP_NAME}] ${message}`),

@@ -1418,7 +1418,8 @@ describe('built-in relay setting (constants)', () => {
       for (const off of ['off', 'OFF', 'False', 'none', '0']) {
         expect((await loadWith(off)).BUILTIN_RELAY_URL, off).toBe('');
       }
-      expect((await loadWith('')).BUILTIN_RELAY_URL).toBe(''); // DEFAULT_BUILTIN_RELAY (none in this repo)
+      // No build variable: this repo's DEFAULT_BUILTIN_RELAY (its Deno Deploy relay).
+      expect((await loadWith('')).BUILTIN_RELAY_URL).toMatch(/^https:\/\/[^/]+\.deno\.net$/);
       expect(warn).not.toHaveBeenCalled();
     });
 

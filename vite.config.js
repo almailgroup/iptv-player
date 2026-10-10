@@ -37,5 +37,7 @@ export default defineConfig({
   test: {
     environment: 'happy-dom',
     include: ['tests/**/*.test.js'],
+    // Tests run without the site's built-in relay unless they set one (vi.stubEnv) themselves.
+    env: { VITE_BUILTIN_RELAY: 'off' },
   },
 });
