@@ -3,6 +3,7 @@ import {
   detectStreamType,
   upgradeToHttps,
   isMixedContent,
+  isPrivateNetworkUrl,
   sniffStreamType,
   backoffDelay,
   classifyBytes,
@@ -134,6 +135,101 @@ describe('isMixedContent', () => {
   it('defaults to location.protocol', () => {
     const expected = globalThis.location?.protocol === 'https:';
     expect(isMixedContent('http://example.com/a.m3u8')).toBe(expected);
+  });
+});
+
+describe('isPrivateNetworkUrl', () => {
+  it.each([
+    // IPv4 literals: private, loopback, link-local, shared (CGNAT) and "this network" ranges
+    'http://10.0.0.5/live.m3u8',
+    'http://10.255.255.255:8080/x',
+    'http://172.16.0.1/x',
+    'http://172.31.255.255/x',
+    'http://192.168.1.20:9981/stream/channel/1',
+    'https://192.168.0.1/live.m3u8',
+    'http://127.0.0.1:8080/x',
+    'http://127.8.9.10/x',
+    'http://169.254.169.254/latest',
+    'http://100.64.0.1/x',
+    'http://100.127.255.255/x',
+    'http://0.0.0.0:8000/x',
+    'http://0.1.2.3/x',
+    // Other spellings the URL parser turns into one of those
+    'http://0x7f.1/x',
+    'http://3232235777/x', // 192.168.1.1
+    'http://192.168.1.1./x',
+    'http://user:pass@192.168.1.1/x',
+    // IPv6 literals: loopback, unspecified, unique-local, link-local, IPv4-mapped
+    'http://[::1]:8000/x',
+    'http://[::]/x',
+    'http://[fc00::1]/x',
+    'http://[fd12:3456:789a::1]:8080/x',
+    'http://[fe80::1]/x',
+    'http://[febf::1]/x',
+    'http://[::ffff:192.168.1.1]/x',
+    'http://[::ffff:c0a8:101]/x',
+    'http://[::ffff:127.0.0.1]/x',
+    // Names that only resolve on this machine or a local network
+    'http://localhost:8080/x',
+    'http://tv.localhost/x',
+    'http://nas.local:8096/x',
+    'HTTP://NAS.LOCAL/x',
+    'http://nas.local./x',
+    'http://box.lan/x',
+    'http://router.home.arpa/x',
+    'http://tvheadend:9981/stream/channel/1',
+    'http://loc%61lhost/x',
+  ])('flags %s', (url) => {
+    expect(isPrivateNetworkUrl(url)).toBe(true);
+  });
+
+  it.each([
+    'http://1.2.3.4:8080/live/index.m3u8',
+    'http://11.0.0.1/x',
+    'http://172.15.255.255/x',
+    'http://172.32.0.1/x',
+    'http://192.169.0.1/x',
+    'http://169.253.1.1/x',
+    'http://100.63.255.255/x',
+    'http://100.128.0.1/x',
+    'http://010.0.0.1/x', // octal: 8.0.0.1
+    'http://example.com/live.m3u8',
+    'https://cdn.example.com/live.m3u8',
+    'http://local.example.com/x',
+    'http://tv.example.lan.com/x',
+    'http://localhost.example.com/x',
+    'http://[2001:4860:4860::8888]/x',
+    'http://[fbff::1]/x',
+    'http://[fec0::1]/x',
+    'http://[::ffff:8.8.8.8]/x',
+    '',
+    'not a url',
+    'file:///home/user/video.mp4',
+    'data:video/mp4;base64,AAAA',
+  ])('does not flag %s', (url) => {
+    expect(isPrivateNetworkUrl(url)).toBe(false);
+  });
+
+  it('judges hosts like the URL parser (its fast path agrees with parsing the URL)', () => {
+    const corpus = [
+      'http://192.168.1.20:9981/x', 'http://1.2.3.4:8080/x', 'http://255.255.255.255/x', 'http://256.1.1.1/x',
+      'http://172.16.0.1:99999/x', 'http://example.com:65535/x', 'http://nas.local/x', 'http://nas/x',
+      'http://user@10.0.0.1/x', 'http://a@b@192.168.0.1/x', 'http://media.internal/x', 'http://x.lan:80/x',
+      'https://cdn.example.com/x', 'http://example.com.:8080/x', 'http://0x7f.0.0.1/x', 'http://1.2.3.04/x',
+      'http://tv-1.example-2.org/x', 'http://xn--bcher-kva.example/x', 'http://localhost/x', 'http://a.0x/x',
+    ];
+    for (const url of corpus) {
+      const parsedPath = url.replace('://', ':\t//'); // the URL parser drops the tab; the fast path can't
+      expect(isPrivateNetworkUrl(url), url).toBe(isPrivateNetworkUrl(parsedPath));
+    }
+    expect(isPrivateNetworkUrl('http://media.internal/x')).toBe(true);
+    expect(isPrivateNetworkUrl('http://a@b@192.168.0.1/x')).toBe(true);
+  });
+
+  it('tolerates non-string input', () => {
+    expect(isPrivateNetworkUrl(null)).toBe(false);
+    expect(isPrivateNetworkUrl(undefined)).toBe(false);
+    expect(isPrivateNetworkUrl(42)).toBe(false);
   });
 });
 

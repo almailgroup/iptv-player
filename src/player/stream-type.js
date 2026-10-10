@@ -150,6 +150,95 @@ export function isMixedContent(url, pageProtocol = globalThis.location?.protocol
   return !isLoopbackHost(parsed.hostname);
 }
 
+/**
+ * Names that only resolve on this machine or a local network: the ones the stream relay refuses too (see
+ * isPrivateHost() in proxy/stream-proxy.js). Single-label names (`tvheadend`, `nas`) are local as well.
+ */
+const LOCAL_NAME_RE = /(?:^|\.)(?:localhost|local|localdomain|internal|intranet|lan|home|corp|home\.arpa)$/;
+/** The authority (`user@host:port`) of an http(s) URL, as the URL parser delimits it. */
+const HTTP_AUTHORITY_RE = /^[\x00-\x20]*https?:\/\/([^/?#\\]*)/i;
+const OCTET = '(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)';
+/** IPv4 in the URL parser's own spelling (no leading zeros, hex or shortened forms such as `127.1`). */
+const CANONICAL_IPV4_RE = new RegExp(`^${OCTET}\\.${OCTET}\\.${OCTET}\\.${OCTET}$`);
+const PLAIN_NAME_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+/** A numeric last label makes the URL parser read the host as an IPv4 address (`0x7f.1`, `3232235777`). */
+const NUMERIC_LABEL_RE = /(?:^|\.)(?:\d+|0x[0-9a-f]*)$/;
+
+/**
+ * The host of an http(s) URL — lowercased, without userinfo and port — when the URL parser would keep it as
+ * written (a plain DNS name or a canonical IPv4 address), else null. Spares parsing the common URLs.
+ */
+function plainHttpHost(url) {
+  const authority = HTTP_AUTHORITY_RE.exec(url)?.[1];
+  if (authority === undefined) return null;
+  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+  const port = /:(\d*)$/.exec(hostPort);
+  if (port && port[1].length > 4) return null; // may be out of range: let the parser judge the URL
+  const host = (port ? hostPort.slice(0, port.index) : hostPort).toLowerCase();
+  if (CANONICAL_IPV4_RE.test(host)) return host;
+  return PLAIN_NAME_RE.test(host) && !NUMERIC_LABEL_RE.test(host) ? host : null;
+}
+
+function isPrivateIpv4(octets) {
+  const [a, b] = octets;
+  return (
+    a === 0 || // "this network", incl. 0.0.0.0
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) || // shared address space (carrier-grade NAT)
+    (a === 169 && b === 254) || // link-local
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+/** @param {string} text  an IPv6 address as the URL parser serializes it (lowercase hex, no brackets) */
+function isPrivateIpv6(text) {
+  const halves = text.split('::');
+  if (halves.length > 2) return false;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return false;
+  const w = [...head, ...Array(fill).fill('0'), ...tail].map((word) =>
+    /^[0-9a-f]{1,4}$/.test(word) ? parseInt(word, 16) : NaN);
+  if (w.length !== 8 || !w.every((word) => word >= 0)) return false;
+  const zeros = (from, to) => w.slice(from, to).every((word) => word === 0);
+  const v4 = () => [w[6] >> 8, w[6] & 0xff, w[7] >> 8, w[7] & 0xff];
+  if (zeros(0, 7) && w[7] <= 1) return true; // :: and ::1
+  if (zeros(0, 5) && (w[5] === 0xffff || w[5] === 0)) return isPrivateIpv4(v4()); // IPv4-mapped / -compatible
+  return (w[0] & 0xfe00) === 0xfc00 || (w[0] & 0xffc0) === 0xfe80; // unique-local fc00::/7, link-local fe80::/10
+}
+
+function isPrivateNetworkHost(host) {
+  if (host.startsWith('[')) return isPrivateIpv6(host.slice(1, -1));
+  const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
+  if (v4) return isPrivateIpv4(v4.slice(1).map(Number));
+  const name = host.endsWith('.') ? host.slice(0, -1) : host;
+  return name !== '' && (!name.includes('.') || LOCAL_NAME_RE.test(name));
+}
+
+/**
+ * True when an http(s) URL points at this computer or a local network: a loopback, private (10/8, 172.16/12,
+ * 192.168/16), link-local (169.254/16), shared (100.64/10) or 0/8 IPv4 address; an IPv6 loopback,
+ * unique-local (fc00::/7), link-local (fe80::/10) or IPv4-mapped one of those; `localhost`, a single-label
+ * name or a local-only domain (`.local`, `.lan`, `.home.arpa` …). A stream relay on the internet can't reach
+ * such a host (and refuses to try). Only literals are judged: what a public name resolves to is up to DNS.
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isPrivateNetworkUrl(url) {
+  const raw = typeof url === 'string' ? url : '';
+  if (!raw) return false;
+  let host = plainHttpHost(raw);
+  if (host === null) {
+    const parsed = tryParseUrl(raw);
+    if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) return false;
+    host = parsed.hostname.toLowerCase();
+  }
+  return isPrivateNetworkHost(host);
+}
+
 /** How many bytes we want before classifying (TS needs ≥ 3 packets + an offset; 2 KB is plenty). */
 const SNIFF_WANT_BYTES = 2048;
 /** Hard cap: never buffer more than this, then cancel the body. */

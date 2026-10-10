@@ -84,7 +84,7 @@
   margin-right: -4px;
 }
 
-/* Non-default sort order: a quiet accent dot instead of a fully highlighted button. */
+/* Non-default sort order or the unplayable filter on: a quiet accent dot instead of a highlighted button. */
 .cl-sort-btn {
   position: relative;
 }
@@ -99,6 +99,12 @@
   background: var(--accent);
   box-shadow: 0 0 0 2px var(--bg);
   pointer-events: none;
+}
+/* "Hide unplayable channels" keeps room for its check mark, so toggling it doesn't resize the menu. */
+.cl-sort-menu .menu-item[role='menuitemcheckbox'][aria-checked='false']::after {
+  content: '';
+  flex: none;
+  width: 16px;
 }
 
 /* --------------------------------------------------------------------------
@@ -305,11 +311,39 @@
   color: var(--text-faint);
   font-size: var(--fs-2xs);
   font-weight: var(--fw-medium);
-  line-height: 15px;
-  vertical-align: 1px;
+  /* 13px + borders fits the meta line (15.5px): rows with chips keep the same vertical rhythm. */
+  line-height: 13px;
 }
-.cl-meta > .cl-tag:first-child {
+.cl-meta > .cl-tag:first-child,
+.cl-flag + .cl-tag {
   margin-left: 0;
+}
+
+/* Playability flag ("Not supported", "DRM", "HTTP", "Unavailable") — leads the meta line, see
+   selectPlayability(). Static reasons are quiet; a remembered failure is warning-tinted. */
+.cl-flag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xs);
+  color: var(--text-muted);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
+  line-height: 13px; /* see .cl-tag */
+  letter-spacing: 0.01em;
+}
+.cl-flag[data-kind='failed'] {
+  border-color: color-mix(in srgb, var(--warning) 38%, transparent);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+/* Can't play here: the name steps back (the current channel keeps its accent). */
+.cl-row.is-unplayable:not(.is-current) .cl-name {
+  color: var(--text-muted);
+}
+.cl-row.is-unplayable:not(.is-current) .cl-avatar {
+  opacity: 0.6;
 }
 
 /* Now-playing equalizer */

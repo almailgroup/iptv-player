@@ -1,14 +1,25 @@
-// App dialogs: Add playlist, Playlist manager, Settings and Keyboard shortcuts.
+// App dialogs: Add playlist, Playlist manager, Settings, the stream-relay setup guide and Keyboard shortcuts.
 // Everything is built with h() (text nodes only) — playlist names, URLs and file names are untrusted.
 
-import { DEFAULT_SETTINGS, SUGGESTED_PLAYLISTS } from '../app/constants.js';
+import { BUILTIN_RELAY_URL, DEFAULT_SETTINGS, SUGGESTED_PLAYLISTS } from '../app/constants.js';
+import { effectiveRelay, hasBuiltinRelay } from '../app/relay.js';
 import { SHORTCUTS } from '../app/shortcuts-list.js';
 import { h, replaceChildren } from '../lib/dom.js';
 import { estimateUsage } from '../lib/storage.js';
-import { clamp, debounce, formatBytes, formatCount, isHttpUrl, uid } from '../lib/utils.js';
+import {
+  clamp,
+  copyText,
+  debounce,
+  downloadText,
+  formatBytes,
+  formatCount,
+  tryParseUrl,
+  uid,
+} from '../lib/utils.js';
 import { icon, setIcon } from './icons.js';
 import { confirmDialog, openModal, promptDialog } from './modal.js';
 import { createThemePicker } from './theme.js';
+import { toast } from './toast.js';
 
 const FILE_ACCEPT = '.m3u,.m3u8,.txt,audio/x-mpegurl,application/x-mpegurl,application/vnd.apple.mpegurl';
 const FILE_EXTENSIONS = ['m3u', 'm3u8', 'txt'];
@@ -905,18 +916,341 @@ export function openPlaylistManager({ store, actions }) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Settings
+// Stream relay ("proxy") — shared by Settings and the setup guide
 // ---------------------------------------------------------------------------------------------------
 
-/** Empty is fine (disabled); otherwise an absolute http(s) URL that the page is allowed to call. */
+const RELAY_SERVICE = 'iptv-stream-relay';
+/** The relay code's `VERSION` export; a deployed relay that reports less is out of date. */
+const RELAY_VERSION_LINE = /^export const VERSION = (\d+);/m;
+/** The relay keeps its allowlist on one line so the guide can swap in this site's origin. */
+const RELAY_ORIGINS_LINE = /^export const ALLOWED_ORIGINS = .*;$/m;
+const RELAY_ENTRY_MARKER =
+  '// ---- entry point (the in-app setup guide swaps this block for the chosen platform) ----';
+/**
+ * Deno Deploy's entry point. Like proxy/deno.js it hands the relay a resolver, so that host names of private
+ * addresses (e.g. 127.0.0.1.nip.io) are refused too; Cloudflare Workers have no DNS API, so they do without.
+ */
+const DENO_ENTRY = [
+  '// ---- entry point: Deno Deploy ----',
+  "/** Errors that mean DNS lookups aren't available here at all (not merely that a name has no records). */",
+  "const LOOKUP_UNAVAILABLE = new Set(['NotSupported', 'PermissionDenied', 'NotCapable']);",
+  "let lookupsAvailable = typeof Deno.resolveDns === 'function';",
+  '',
+  '// Every address a host name resolves to (A and AAAA records), so that the relay also refuses names that',
+  "// point at private addresses. Rejects when a name doesn't resolve; null (no check) if DNS is unavailable.",
+  'async function resolveHost(hostname) {',
+  "  if (!lookupsAvailable) return null; // can't look names up here: relay as if there were no resolver",
+  '  let unavailable = false;',
+  '  const lookup = async (type) => {',
+  '    try {',
+  '      return await Deno.resolveDns(hostname, type);',
+  '    } catch (err) {',
+  '      if (err instanceof TypeError || LOOKUP_UNAVAILABLE.has(err?.name)) unavailable = true;',
+  '      return null; // e.g. no AAAA records',
+  '    }',
+  '  };',
+  "  const [v4, v6] = await Promise.all([lookup('A'), lookup('AAAA')]);",
+  '  if (v4 || v6) return [...(v4 || []), ...(v6 || [])];',
+  '  if (unavailable) {',
+  '    lookupsAvailable = false;',
+  "    console.warn('DNS lookups are unavailable here; host names are no longer checked for private addresses.');",
+  '    return null;',
+  '  }',
+  "  throw new Error(`Couldn't resolve ${hostname}`);",
+  '}',
+  '',
+  'Deno.serve((request) => handleRequest(request, { resolveHost }));',
+  '',
+].join('\n');
+/** Local dev servers (`vite` and `vite preview`) the copied relay allows besides this site. */
+const DEV_ORIGINS = [
+  'http://localhost:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:4173',
+];
+const HEALTH_TIMEOUT_MS = 10_000;
+const PROXY_PLACEHOLDER = 'https://your-relay.deno.dev';
+const RELAY_DOCS_URL = 'https://github.com/almailgroup/iptv-player/blob/main/proxy/README.md';
+
+/** Where the guide's steps point, per hosting platform. */
+const RELAY_PLATFORMS = {
+  deno: { label: 'Deno Deploy', placeholder: PROXY_PLACEHOLDER },
+  cloudflare: { label: 'Cloudflare Workers', placeholder: 'https://your-relay.workers.dev' },
+};
+
+/** proxy/stream-proxy.js as text, once loadRelaySource() has fetched it ('' before). */
+let relaySourceText = '';
+let relaySourceLoad = null;
+
+/**
+ * The relay's source code (proxy/stream-proxy.js). It's a separate ~60 kB chunk that only the setup guide's
+ * "Copy relay code" (and the out-of-date check of a relay test) needs, so it stays out of the main bundle.
+ * The result is cached; a failed download (e.g. offline) is retried on the next call.
+ * @returns {Promise<string>}
+ */
+export function loadRelaySource() {
+  relaySourceLoad ??= import('../../proxy/stream-proxy.js?raw').then(
+    ({ default: source }) => {
+      relaySourceText = String(source);
+      return relaySourceText;
+    },
+    (err) => {
+      relaySourceLoad = null;
+      throw err;
+    },
+  );
+  return relaySourceLoad;
+}
+
+/** Version of the relay code this site ships (0 when it can't be loaded). */
+async function shippedRelayVersion() {
+  try {
+    return Number(RELAY_VERSION_LINE.exec(await loadRelaySource())?.[1]) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+const pageOrigin = () => {
+  const url = tryParseUrl(globalThis.location?.origin || '');
+  return url && (url.protocol === 'http:' || url.protocol === 'https:') ? url.origin : '';
+};
+
+/** Same loopback rules as the browser's "potentially trustworthy" http:// hosts. */
+function isLoopbackHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === '[::1]' ||
+    /^127(?:\.\d{1,3}){3}$/.test(host)
+  );
+}
+
+/**
+ * Empty is fine (disabled); otherwise an absolute http(s) URL that this page is allowed to call: secure pages
+ * may only use https:// — or http://localhost, which browsers treat as secure.
+ */
 function validateProxy(value) {
   if (!value) return '';
-  if (!isHttpUrl(value)) return 'Enter a full http(s) address, for example https://corsproxy.example/?url=';
-  if (globalThis.location?.protocol === 'https:' && /^http:/i.test(value)) {
-    return 'Use an https:// proxy — browsers block insecure requests from secure pages.';
+  const url = tryParseUrl(value);
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
+    return `Enter a full http(s) address, for example ${PROXY_PLACEHOLDER}`;
+  }
+  const securePage = globalThis.location?.protocol === 'https:';
+  if (securePage && url.protocol === 'http:' && !isLoopbackHost(url.hostname)) {
+    return (
+      'Use an https:// address — browsers block insecure requests from secure pages ' +
+      '(http://localhost is fine).'
+    );
   }
   return '';
 }
+
+const quoteJs = (value) => `'${String(value).replace(/[\\']/g, '\\$&')}'`;
+
+/**
+ * The relay code ready to paste into a hosting platform: its ALLOWED_ORIGINS line lists `origin` (this site)
+ * plus the local dev servers and, for Deno Deploy, the default-export entry point is replaced with
+ * `Deno.serve`.
+ * @param {string} relaySource proxy/stream-proxy.js's source (see loadRelaySource())
+ * @param {'deno' | 'cloudflare'} platform
+ * @param {string} [origin] the site that will use the relay; defaults to this page's origin
+ * @returns {string}
+ */
+export function relaySourceFor(relaySource, platform, origin = pageOrigin()) {
+  const site = tryParseUrl(String(origin || ''));
+  const own = site && (site.protocol === 'http:' || site.protocol === 'https:') ? [site.origin] : [];
+  const origins = [...new Set([...own, ...DEV_ORIGINS])];
+  const line = `export const ALLOWED_ORIGINS = [${origins.map(quoteJs).join(', ')}];`;
+  let source = String(relaySource).replace(RELAY_ORIGINS_LINE, () => line);
+  if (platform === 'deno') {
+    const at = source.indexOf(RELAY_ENTRY_MARKER);
+    source = `${at >= 0 ? source.slice(0, at) : `${source.trimEnd()}\n\n`}${DENO_ENTRY}`;
+  }
+  return source;
+}
+
+/**
+ * The relay's health-check address for a proxy setting: `<origin><path>?health`, where the path is the
+ * setting's own path (up to a `{url}` placeholder; query and hash dropped). '' unless it's an http(s) URL.
+ * @param {string} proxy
+ * @returns {string}
+ */
+export function proxyHealthUrl(proxy) {
+  const value = typeof proxy === 'string' ? proxy.trim() : '';
+  const placeholder = value.search(/\{url\}/i);
+  const url = tryParseUrl(placeholder >= 0 ? value.slice(0, placeholder) : value);
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) return '';
+  return `${url.origin}${url.pathname}?health`;
+}
+
+const HEALTH = {
+  invalid: { status: 'error', message: `Enter a full http(s) address, for example ${PROXY_PLACEHOLDER}` },
+  timeout: {
+    status: 'error',
+    message: 'The relay didn’t answer within 10 seconds. Check the address, or try again in a moment.',
+  },
+  unreachable: {
+    status: 'error',
+    message: 'Couldn’t reach the relay. Check the address and that the relay is deployed.',
+  },
+  foreign: {
+    status: 'warning',
+    message:
+      'This address answers, but it isn’t the IPTV stream relay. Playlists may load through it; blocked ' +
+      'streams may not play.',
+  },
+};
+
+/**
+ * Ask a stream relay whether it's up and allows this site: `GET <proxy>/?health` (see proxyHealthUrl()).
+ * A relay older than the code this site ships is reported as out of date. Never throws.
+ * @param {string} proxy the relay setting
+ * @param {{ signal?: AbortSignal, timeoutMs?: number, fetchImpl?: typeof fetch }} [options]
+ * @returns {Promise<{ status: 'ok' | 'warning' | 'error', message: string, version?: number } | null>}
+ *   null when `signal` aborted the check.
+ */
+export async function checkProxyHealth(
+  proxy,
+  { signal, timeoutMs = HEALTH_TIMEOUT_MS, fetchImpl = globalThis.fetch } = {},
+) {
+  const url = proxyHealthUrl(proxy);
+  if (!url) return { ...HEALTH.invalid };
+  if (signal?.aborted) return null;
+  const controller = new AbortController();
+  let timedOut = false;
+  const onAbort = () => controller.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const init = { method: 'GET', cache: 'no-store', credentials: 'omit', signal: controller.signal };
+  const interrupted = () => (signal?.aborted ? null : timedOut ? { ...HEALTH.timeout } : undefined);
+  try {
+    let res;
+    try {
+      res = await fetchImpl(url, init);
+    } catch {
+      const stop = interrupted();
+      if (stop !== undefined) return stop;
+      // Unreachable, or running without CORS headers for this site (the relay's allowlist): an opaque
+      // no-cors request still succeeds in the second case, which tells the two apart.
+      const reachable = await fetchImpl(url, { ...init, mode: 'no-cors' }).then(
+        () => true,
+        () => false,
+      );
+      const late = interrupted();
+      if (late !== undefined) return late;
+      if (!reachable) return { ...HEALTH.unreachable };
+      const site = pageOrigin();
+      return {
+        status: 'error',
+        message:
+          `The relay is running but doesn’t allow this site${site ? ` (${site})` : ''}. Copy the relay ` +
+          'code again from the setup guide and redeploy it.',
+      };
+    }
+    if (!res.ok) {
+      const refused = res.status === 401 || res.status === 403;
+      return {
+        status: 'error',
+        message: refused
+          ? `The relay refused this site (HTTP ${res.status}).`
+          : `The relay answered with an error (HTTP ${res.status}). Check the address.`,
+      };
+    }
+    let info = null;
+    try {
+      info = JSON.parse(await res.text());
+    } catch {
+      const stop = interrupted();
+      if (stop !== undefined) return stop;
+    }
+    if (!info || info.ok !== true || info.service !== RELAY_SERVICE) return { ...HEALTH.foreign };
+    const version = Number.isInteger(info.version) && info.version > 0 ? info.version : 0;
+    const working = `Relay is working${version ? ` (v${version})` : ''}`;
+    const latest = version ? await shippedRelayVersion() : 0;
+    if (signal?.aborted) return null;
+    if (version && version < latest) {
+      return {
+        status: 'warning',
+        version,
+        message: `${working}, but it’s out of date. Copy the relay code again and redeploy it to update.`,
+      };
+    }
+    return { status: 'ok', version, message: working };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+const CHECK_ICON = { ok: 'check', warning: 'alert', error: 'alert' };
+
+/** Settings hints of the "Use the built-in relay" switch. */
+const BUILTIN_HINT = {
+  on:
+    'Lets insecure (http://) and blocked channels play. Your viewing of those channels passes through this ' +
+    'site’s relay.',
+  overridden: 'Not used while your own relay is set below.',
+};
+
+/**
+ * A health check of the built-in relay, worded for visitors: they can't fix its setup (and an older version
+ * still works), so a problem just means "not working right now".
+ */
+function builtinHealth(result) {
+  if (result.status === 'ok' || result.version) {
+    const version = result.version ? ` (v${result.version})` : '';
+    return { status: 'ok', message: `The built-in relay is working${version}` };
+  }
+  return {
+    status: 'error',
+    message: 'The built-in relay isn’t working right now. Try again later, or set up your own relay.',
+  };
+}
+
+/** Inline result line for a relay test (a polite live region; empty while there is nothing to say). */
+function createCheckLine(id) {
+  const el = h('p', { class: 'dlg-check', id, role: 'status' });
+  let value = '';
+  return {
+    el,
+    /** The relay address the current message is about ('' when cleared). */
+    get value() {
+      return value;
+    },
+    set(status, message, about = '') {
+      value = about;
+      el.dataset.status = status;
+      replaceChildren(
+        el,
+        status === 'pending' ? spinner() : icon(CHECK_ICON[status] || 'info', { size: 14 }),
+        h('span', { class: 'dlg-check-text', text: message }),
+      );
+    },
+    clear() {
+      value = '';
+      delete el.dataset.status;
+      replaceChildren(el);
+    },
+  };
+}
+
+const externalLink = (href, text) =>
+  h(
+    'a',
+    { class: 'dlg-link', href, target: '_blank', rel: 'noopener noreferrer' },
+    text,
+    icon('external', { size: 12 }),
+  );
+
+// ---------------------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------------------
 
 /**
  * Settings: playback, library, network, appearance and data. Changes apply immediately.
@@ -1054,9 +1388,17 @@ export function openSettingsDialog({ store, actions }) {
     h('span', { class: 'dlg-select-wrap' }, refreshSelect, icon('chevron-down', { size: 16 })),
   );
 
-  // ----- CORS proxy -----
+  // ----- Stream relay -----
+  // With a built-in relay (BUILTIN_RELAY_URL) the field is the user's own relay, which overrides it; without
+  // one it's the only relay there is. "Test" checks whichever relay is in effect.
+  const builtin = hasBuiltinRelay();
+  const builtinRow = builtin ? switchRow('useBuiltinRelay', 'Use the built-in relay', BUILTIN_HINT.on) : null;
+  const builtinHint = builtinRow?.querySelector('.dlg-row-hint');
   const proxyId = uid('dlg-set-proxy');
   const proxyError = errorSlot(`${proxyId}-error`);
+  const proxyCheck = createCheckLine(`${proxyId}-check`);
+  /** The running "Test" (aborted when the value changes or the dialog closes). */
+  let proxyTest = null;
   const proxyInput = h('input', {
     class: 'input',
     type: 'url',
@@ -1064,11 +1406,14 @@ export function openSettingsDialog({ store, actions }) {
     inputmode: 'url',
     autocomplete: 'off',
     autocapitalize: 'off',
-    placeholder: 'https://corsproxy.example/?url=',
-    'aria-describedby': `${proxyId}-hint ${proxyId}-error`,
+    placeholder: PROXY_PLACEHOLDER,
+    'aria-describedby': `${proxyId}-hint ${proxyId}-error ${proxyId}-check`,
     'aria-invalid': 'false',
     onInput: () => {
       setFieldError(proxyError, proxyInput, '');
+      cancelProxyTest();
+      proxyCheck.clear();
+      renderProxyTools();
       commitProxyLater();
     },
     onChange: () => {
@@ -1095,24 +1440,96 @@ export function openSettingsDialog({ store, actions }) {
     return true;
   }
   const commitProxyLater = debounce(() => commitProxy(false), 450);
+  const testBtn = h('button', {
+    type: 'button',
+    class: 'btn btn-secondary dlg-proxy-test',
+    text: 'Test',
+    'aria-describedby': `${proxyId}-check`,
+    onClick: () => testProxy(),
+  });
+  const guideBtn = h(
+    'button',
+    {
+      type: 'button',
+      class: 'btn btn-ghost btn-sm dlg-link-btn',
+      onClick: () => openProxyGuide({ store, actions }),
+    },
+    icon('broadcast', { size: 15 }),
+    h('span', { text: builtin ? 'Set up your own relay…' : 'Set up a free relay…' }),
+  );
   const proxyRow = h(
     'div',
-    { class: 'dlg-row dlg-row-stack' },
+    { class: 'dlg-row dlg-row-stack dlg-row-proxy' },
     h(
       'span',
       { class: 'dlg-row-text' },
-      h('label', { class: 'dlg-row-label', htmlFor: proxyId, text: 'CORS proxy (optional)' }),
+      h('label', {
+        class: 'dlg-row-label',
+        htmlFor: proxyId,
+        text: builtin ? 'Your own relay (optional)' : 'Relay (optional)',
+      }),
       h('span', {
         class: 'dlg-row-hint',
         id: `${proxyId}-hint`,
-        text:
-          'Used only for downloading playlists that block cross-origin requests. Example: ' +
-          'https://corsproxy.example/?url= — leave empty to disable.',
+        text: builtin
+          ? 'Overrides the built-in relay.'
+          : 'Your own relay for streams and playlists that browsers block (insecure HTTP or missing CORS). ' +
+            'Leave empty to disable.',
       }),
     ),
-    proxyInput,
+    h('div', { class: 'dlg-inline' }, proxyInput, testBtn),
     proxyError,
+    proxyCheck.el,
+    h('div', { class: 'dlg-row-tools' }, guideBtn),
   );
+  const proxyStreamsRow = switchRow(
+    'proxyStreams',
+    'Play blocked streams through the relay',
+    'Only channels your browser would block go through it — the rest play directly.',
+  );
+  const proxyStreamsInput = proxyStreamsRow.querySelector('input');
+
+  /** What "Test" checks: the typed own relay, else the built-in one while it's on ('' = nothing). */
+  function testTarget() {
+    const typed = proxyInput.value.trim();
+    if (typed) return typed;
+    return builtin && settings().useBuiltinRelay !== false ? BUILTIN_RELAY_URL : '';
+  }
+  function renderProxyTools() {
+    const target = testTarget();
+    testBtn.disabled = !target;
+    testBtn.title = target && !proxyInput.value.trim() ? 'Test the built-in relay' : 'Test your relay';
+    testBtn.setAttribute('aria-busy', String(!!proxyTest));
+  }
+  function cancelProxyTest() {
+    if (!proxyTest) return;
+    proxyTest.abort();
+    proxyTest = null;
+    proxyCheck.clear();
+    renderProxyTools();
+  }
+  async function testProxy() {
+    if (proxyTest || closed) return;
+    commitProxyLater.cancel();
+    if (!commitProxy(true)) {
+      proxyInput.focus();
+      return;
+    }
+    const value = testTarget();
+    if (!value) return;
+    const isBuiltin = !proxyInput.value.trim();
+    const controller = new AbortController();
+    proxyTest = controller;
+    renderProxyTools();
+    proxyCheck.set('pending', isBuiltin ? 'Testing the built-in relay…' : 'Testing your relay…', value);
+    const result = await checkProxyHealth(value, { signal: controller.signal });
+    if (proxyTest !== controller) return; // value changed, reset or dialog closed meanwhile
+    proxyTest = null;
+    renderProxyTools();
+    if (!result) return;
+    const shown = isBuiltin ? builtinHealth(result) : result;
+    proxyCheck.set(shown.status, shown.message, value);
+  }
 
   // ----- Data -----
   const usageHint = h('span', { class: 'dlg-row-hint' });
@@ -1170,6 +1587,8 @@ export function openSettingsDialog({ store, actions }) {
     });
     if (ok) {
       setFieldError(proxyError, proxyInput, '');
+      cancelProxyTest();
+      proxyCheck.clear();
       apply({ ...DEFAULT_SETTINGS });
     }
   }
@@ -1195,7 +1614,7 @@ export function openSettingsDialog({ store, actions }) {
       switchRow(
         'upgradeInsecure',
         'Upgrade HTTP streams to HTTPS',
-        'On secure pages, try an https:// address first for http:// streams.',
+        'On secure pages, try an https:// address for http:// streams that don’t use the relay.',
       ),
       switchRow('lowLatency', 'Low-latency mode', 'Stay closer to the live edge on low-latency HLS streams.'),
       switchRow(
@@ -1217,7 +1636,7 @@ export function openSettingsDialog({ store, actions }) {
       ),
       refreshRow,
     ]),
-    section('Network', [proxyRow]),
+    section('Network', [builtinRow, proxyRow, proxyStreamsRow]),
     section(
       'Appearance',
       [h('div', { class: 'dlg-card-pad' }, createThemePicker({ store, actions }))],
@@ -1236,6 +1655,20 @@ export function openSettingsDialog({ store, actions }) {
     renderRefreshOptions(Number(s.autoRefreshHours));
     // Don't clobber what the user is typing (or an invalid value they still need to fix).
     if (document.activeElement !== proxyInput && !proxyError.textContent) proxyInput.value = s.corsProxy || '';
+    // A test of another relay (e.g. before one was saved from the setup guide, or of the built-in one after
+    // it was switched off) no longer applies.
+    if (proxyCheck.value && proxyCheck.value !== testTarget()) {
+      cancelProxyTest();
+      proxyCheck.clear();
+    }
+    const hasRelay = !!effectiveRelay(s);
+    proxyStreamsInput.disabled = !hasRelay;
+    proxyStreamsRow.classList.toggle('is-disabled', !hasRelay);
+    if (builtinHint) {
+      const hint = String(s.corsProxy || '').trim() ? BUILTIN_HINT.overridden : BUILTIN_HINT.on;
+      if (builtinHint.textContent !== hint) builtinHint.textContent = hint;
+    }
+    renderProxyTools();
     renderUsage();
   }
 
@@ -1259,11 +1692,450 @@ export function openSettingsDialog({ store, actions }) {
       closed = true;
       unsubscribe();
       commitProxyLater.cancel();
-      commitProxy(false); // keep a valid proxy typed right before closing
+      cancelProxyTest();
+      commitProxy(false); // keep a valid relay address typed right before closing
       if (openDialogs.get('settings')?.handle === handle) openDialogs.delete('settings');
     },
   });
   openDialogs.set('settings', { handle });
+  return handle;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Proxy setup guide
+// ---------------------------------------------------------------------------------------------------
+
+/** The guide reopens on the platform picked last time. */
+let lastGuidePlatform = 'deno';
+
+/**
+ * "Play blocked channels": why some channels are blocked on secure sites, step-by-step setup of a personal
+ * stream relay (Deno Deploy or Cloudflare Workers, with the relay code ready to paste) and an inline
+ * "Save & test" for its address (saves `corsProxy`, turns on `proxyStreams`, runs the health check). When the
+ * site has a built-in relay, the guide is "Use your own relay" and says it's only needed for that.
+ * @param {{ store: object, actions: object }} deps
+ * @returns {{ el: HTMLDialogElement, close: Function,
+ *   result: Promise<{ proxy: string, working: boolean } | undefined> }} modal handle; `result` resolves when
+ *   the dialog closes, with the proxy saved here (and whether its health check passed) or undefined.
+ */
+export function openProxyGuide({ store, actions }) {
+  const existing = openDialogs.get('guide');
+  if (existing) return existing.handle;
+
+  const base = uid('dlg-guide');
+  const ids = {
+    url: `${base}-url`,
+    urlError: `${base}-url-error`,
+    check: `${base}-check`,
+    setup: `${base}-setup`,
+    connect: `${base}-connect`,
+  };
+  let platform = RELAY_PLATFORMS[lastGuidePlatform] ? lastGuidePlatform : 'deno';
+  let closed = false;
+  let modal = null;
+  /** What "Save & test" stored, reported as the dialog's result. */
+  let saved = null;
+  /** The running health check. */
+  let test = null;
+  const timers = new Set();
+  const later = (fn, ms) => {
+    const t = setTimeout(() => {
+      timers.delete(t);
+      fn();
+    }, ms);
+    timers.add(t);
+    return t;
+  };
+  const cancelLater = (t) => {
+    clearTimeout(t);
+    timers.delete(t);
+  };
+
+  const strong = (text) => h('strong', { text });
+  const code = (text) => h('code', { class: 'dlg-code', text });
+  const builtin = hasBuiltinRelay();
+
+  // The ~60 kB relay code isn't part of the app bundle: fetch it now, so "Copy relay code" can copy it
+  // synchronously within the click (Safari refuses clipboard writes that wait for the network).
+  loadRelaySource().catch(() => {});
+
+  // ----- Why -----
+  const fact = (name, text) => h('li', null, icon(name, { size: 14 }), h('span', { text }));
+  const intro = builtin
+    ? [
+        h(
+          'p',
+          null,
+          strong('You probably don’t need this. '),
+          'This site already plays insecure (http://) and blocked channels through its built-in relay. Set ' +
+            'up your own only if you’d rather your viewing went through a relay you control, or if the ' +
+            'built-in one can’t reach a channel.',
+        ),
+        h(
+          'p',
+          null,
+          strong('How it works. '),
+          'Your relay fetches the stream for you and hands it to the player over a secure connection, ' +
+            'instead of the built-in one. Only the channels your browser would block go through it.',
+        ),
+      ]
+    : [
+        h(
+          'p',
+          null,
+          strong('Why some channels won’t play. '),
+          'Many channels use insecure http:// links, or servers that don’t allow web players. Browsers ' +
+            'block those on secure (https://) sites like this one, and no website can get around it.',
+        ),
+        h(
+          'p',
+          null,
+          strong('The fix. '),
+          'A personal relay fetches the stream for you and hands it to the player over a secure ' +
+            'connection. Only the channels your browser would block go through it.',
+        ),
+      ];
+  const why = h(
+    'div',
+    { class: 'dlg-guide-why' },
+    intro,
+    h(
+      'ul',
+      { class: 'dlg-guide-facts', 'aria-label': 'At a glance' },
+      fact('check', 'Free'),
+      fact('clock', 'About 5 minutes'),
+      fact('link', 'Your traffic goes through your relay'),
+    ),
+  );
+
+  // ----- Platforms -----
+  function copyButton(key) {
+    const label = h('span', { text: 'Copy relay code' });
+    let resetTimer = 0;
+    const btn = h(
+      'button',
+      { type: 'button', class: 'btn btn-secondary btn-sm dlg-copy-btn', onClick: () => copyRelay() },
+      icon('copy', { size: 14 }),
+      label,
+    );
+    async function copyRelay() {
+      let source;
+      try {
+        source = relaySourceFor(relaySourceText || (await loadRelaySource()), key);
+      } catch {
+        if (!closed) toast.error('Couldn’t load the relay code. Check your connection and try again.');
+        return;
+      }
+      if (closed) return;
+      const ok = await copyText(source);
+      if (closed) return;
+      if (!ok) {
+        toast.error('Couldn’t copy the relay code', {
+          action: {
+            label: 'Download',
+            onClick: () => downloadText('stream-proxy.js', source, 'text/javascript'),
+          },
+        });
+        return;
+      }
+      toast.success('Relay code copied');
+      btn.classList.add('is-done');
+      setIcon(btn, 'check', { size: 14 });
+      label.textContent = 'Copied';
+      cancelLater(resetTimer);
+      resetTimer = later(() => {
+        btn.classList.remove('is-done');
+        setIcon(btn, 'copy', { size: 14 });
+        label.textContent = 'Copy relay code';
+      }, 2200);
+    }
+    return btn;
+  }
+
+  const steps = (items) =>
+    h(
+      'ol',
+      { class: 'dlg-steps' },
+      items.map(([text, action]) =>
+        h(
+          'li',
+          { class: 'dlg-step' },
+          h('span', { class: 'dlg-step-text' }, text),
+          action ? h('div', { class: 'dlg-step-action' }, action) : null,
+        ),
+      ),
+    );
+
+  const callout = (tone, iconName, text) =>
+    h('p', { class: 'dlg-callout', dataset: { tone } }, icon(iconName, { size: 15 }), h('span', { text }));
+
+  const content = {
+    // Deno's dashboard changes now and then: describe each step instead of naming exact buttons.
+    deno: [
+      callout('success', 'check', 'Reaches every stream, including ones on IP addresses and custom ports.'),
+      steps([
+        [['Open ', externalLink('https://console.deno.com', 'console.deno.com'), ' and sign in. It’s free.']],
+        [['Create a new ', strong('playground'), ' (or a new app).']],
+        [['Copy the relay code and paste it into the editor, replacing everything.'], copyButton('deno')],
+        [['Deploy it.']],
+        [['Copy its public https:// address (it ends in .deno.net or .deno.dev) and paste it below.']],
+      ]),
+    ],
+    cloudflare: [
+      callout(
+        'warning',
+        'alert',
+        'Can’t reach streams on IP addresses or custom ports — use Deno Deploy for those.',
+      ),
+      steps([
+        [
+          [
+            'Open ',
+            externalLink('https://dash.cloudflare.com', 'dash.cloudflare.com'),
+            ' and sign in. It’s free.',
+          ],
+        ],
+        [
+          [
+            'Go to ',
+            strong('Workers & Pages'),
+            ' → ',
+            strong('Create'),
+            ' → ',
+            strong('Worker'),
+            ', then click ',
+            strong('Deploy'),
+            '.',
+          ],
+        ],
+        [
+          ['Click ', strong('Edit code'), ', then paste the relay code, replacing everything.'],
+          copyButton('cloudflare'),
+        ],
+        [['Click ', strong('Deploy'), '.']],
+        [['Copy the worker’s ', code('https://….workers.dev'), ' address and paste it below.']],
+      ]),
+    ],
+  };
+
+  const tabs = {};
+  const panels = {};
+  for (const key of Object.keys(RELAY_PLATFORMS)) {
+    const tabId = `${base}-tab-${key}`;
+    const panelId = `${base}-panel-${key}`;
+    tabs[key] = h(
+      'button',
+      { type: 'button', role: 'tab', id: tabId, 'aria-controls': panelId, onClick: () => select(key) },
+      h('span', { text: RELAY_PLATFORMS[key].label }),
+      key === 'deno' ? h('span', { class: 'dlg-tab-badge', text: 'Recommended' }) : null,
+    );
+    panels[key] = h(
+      'div',
+      { class: 'dlg-guide-panel', role: 'tabpanel', id: panelId, 'aria-labelledby': tabId },
+      content[key],
+    );
+  }
+  const keys = Object.keys(tabs);
+  const tablist = h(
+    'div',
+    {
+      class: 'segmented dlg-tabs dlg-guide-tabs',
+      role: 'tablist',
+      'aria-label': 'Where to host your relay',
+      onKeydown: (e) => {
+        const i = keys.indexOf(platform);
+        let next = null;
+        if (e.key === 'ArrowRight') next = keys[(i + 1) % keys.length];
+        else if (e.key === 'ArrowLeft') next = keys[(i - 1 + keys.length) % keys.length];
+        else if (e.key === 'Home') next = keys[0];
+        else if (e.key === 'End') next = keys[keys.length - 1];
+        if (!next) return;
+        e.preventDefault();
+        e.stopPropagation();
+        select(next, { focusTab: true });
+      },
+    },
+    keys.map((key) => tabs[key]),
+  );
+
+  const ownServer = h(
+    'p',
+    { class: 'dlg-note dlg-guide-own' },
+    icon('info', { size: 13 }),
+    h(
+      'span',
+      null,
+      strong('Own server or computer? '),
+      'Run ',
+      code('proxy/node-server.mjs'),
+      ' with Node.js — on this computer the address is ',
+      code('http://localhost:8787'),
+      '. ',
+      externalLink(RELAY_DOCS_URL, 'Relay guide on GitHub'),
+    ),
+  );
+
+  // ----- Connect -----
+  const urlError = errorSlot(ids.urlError);
+  const check = createCheckLine(ids.check);
+  const urlInput = h('input', {
+    class: 'input',
+    id: ids.url,
+    type: 'url',
+    inputmode: 'url',
+    autocomplete: 'off',
+    autocapitalize: 'off',
+    value: String(store.get().settings?.corsProxy || ''),
+    'aria-describedby': `${ids.urlError} ${ids.check}`,
+    'aria-invalid': 'false',
+    onInput: () => {
+      setFieldError(urlError, urlInput, '');
+      cancelTest();
+      check.clear();
+    },
+  });
+  urlInput.setAttribute('spellcheck', 'false');
+  const saveBtn = h('button', {
+    type: 'submit',
+    class: 'btn btn-primary dlg-save-test',
+    text: 'Save & test',
+  });
+  const connectForm = h(
+    'form',
+    {
+      class: 'dlg-guide-connect',
+      novalidate: true,
+      onSubmit: (e) => {
+        e.preventDefault();
+        saveAndTest();
+      },
+    },
+    h('label', { class: 'field-label', htmlFor: ids.url, text: 'Your relay’s address' }),
+    h('div', { class: 'dlg-inline' }, urlInput, saveBtn),
+    urlError,
+    check.el,
+  );
+
+  const doneBtn = h('button', {
+    type: 'button',
+    class: 'btn btn-secondary',
+    text: 'Done',
+    onClick: () => modal?.close(),
+  });
+
+  // ----- Behaviour -----
+  function select(next, { focusTab = false } = {}) {
+    if (!tabs[next]) return;
+    platform = next;
+    lastGuidePlatform = next;
+    for (const key of keys) {
+      const on = key === next;
+      tabs[key].setAttribute('aria-selected', String(on));
+      tabs[key].tabIndex = on ? 0 : -1;
+      panels[key].hidden = !on;
+    }
+    urlInput.placeholder = RELAY_PLATFORMS[next].placeholder;
+    if (focusTab) tabs[next].focus();
+  }
+
+  function cancelTest() {
+    if (!test) return;
+    test.abort();
+    test = null;
+    renderTesting();
+  }
+
+  function renderTesting() {
+    const busy = !!test;
+    saveBtn.setAttribute('aria-disabled', String(busy));
+    saveBtn.classList.toggle('is-loading', busy);
+    replaceChildren(saveBtn, busy ? [spinner(), 'Testing…'] : 'Save & test');
+    connectForm.setAttribute('aria-busy', String(busy));
+  }
+
+  async function saveAndTest() {
+    if (closed || test) return;
+    const value = urlInput.value.trim();
+    const invalid = value
+      ? validateProxy(value)
+      : `Paste your relay’s address, for example ${RELAY_PLATFORMS[platform].placeholder}`;
+    if (invalid) {
+      setFieldError(urlError, urlInput, invalid);
+      urlInput.focus();
+      return;
+    }
+    setFieldError(urlError, urlInput, '');
+    try {
+      actions.updateSettings({ corsProxy: value, proxyStreams: true });
+    } catch (err) {
+      setFieldError(urlError, urlInput, messageOf(err));
+      return;
+    }
+    saved = { proxy: value, working: false };
+    const controller = new AbortController();
+    test = controller;
+    renderTesting();
+    check.set('pending', 'Saved. Testing your relay…', value);
+    const result = await checkProxyHealth(value, { signal: controller.signal });
+    if (test !== controller) return; // edited, superseded or closed meanwhile
+    test = null;
+    renderTesting();
+    if (!result) return;
+    const working = result.status === 'ok' || !!result.version;
+    saved.working = working;
+    const message =
+      result.status === 'ok' ? `${result.message}. Blocked channels will now play through it.` : result.message;
+    check.set(result.status, message, value);
+    doneBtn.className = working ? 'btn btn-primary' : 'btn btn-secondary';
+  }
+
+  select(platform);
+  renderTesting();
+
+  const body = h(
+    'div',
+    { class: 'dlg-guide' },
+    why,
+    h(
+      'section',
+      { class: 'dlg-guide-section', 'aria-labelledby': ids.setup },
+      h('h3', { class: 'dlg-subtitle', id: ids.setup, text: '1 · Create your relay' }),
+      tablist,
+      keys.map((key) => panels[key]),
+      ownServer,
+    ),
+    h(
+      'section',
+      { class: 'dlg-guide-section', 'aria-labelledby': ids.connect },
+      h('h3', { class: 'dlg-subtitle', id: ids.connect, text: '2 · Connect it' }),
+      connectForm,
+    ),
+  );
+
+  modal = openModal({
+    title: builtin ? 'Use your own relay' : 'Play blocked channels',
+    description: builtin
+      ? 'Optional — this site’s built-in relay already plays blocked channels.'
+      : 'Your own free relay lets you watch them here too.',
+    body,
+    footer: [doneBtn],
+    size: 'md',
+    className: 'dlg-guide-dialog',
+    initialFocus: tabs[platform],
+    onClose: () => {
+      closed = true;
+      cancelTest();
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
+      if (openDialogs.get('guide')?.handle === handle) openDialogs.delete('guide');
+    },
+  });
+  const handle = {
+    el: modal.el,
+    close: modal.close,
+    result: modal.result.then(() => (saved ? { ...saved } : undefined)),
+  };
+  openDialogs.set('guide', { handle });
   return handle;
 }
 

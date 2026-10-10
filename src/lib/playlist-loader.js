@@ -147,22 +147,67 @@ function toHttps(href) {
 }
 
 /**
- * Build the request URL for a CORS proxy. A `{url}` placeholder is replaced with the encoded target; a proxy
- * ending in `=` (e.g. `https://proxy.example/?url=`) gets the encoded target appended; any other proxy is used
- * as a plain prefix (`https://proxy.example/` + target). Returns '' when the result isn't an http(s) URL.
+ * How a proxy setting turns a target into a request URL: `prefix` is everything before the target, `kind` is
+ * 'template' ({url} placeholder), 'encoded' (prefix + encoded target) or 'raw' (prefix + target as-is).
+ * null for an empty setting.
+ */
+function proxyForm(proxy) {
+  const base = typeof proxy === 'string' ? proxy.trim() : '';
+  if (!base) return null;
+  const placeholder = base.search(/\{url\}/i);
+  if (placeholder >= 0) return { base, prefix: base.slice(0, placeholder), kind: 'template' };
+  if (base.endsWith('=')) return { base, prefix: base, kind: 'encoded' };
+  if (!base.includes('?') && !base.endsWith('/')) {
+    // A bare relay origin (https://relay.example.deno.dev): the relay's canonical query form.
+    const url = tryParseUrl(base);
+    if (url && (url.protocol === 'http:' || url.protocol === 'https:') && url.pathname === '/') {
+      return { base, prefix: `${url.origin}/?url=`, kind: 'encoded' };
+    }
+  }
+  return { base, prefix: base, kind: 'raw' };
+}
+
+/**
+ * Build the request URL for a proxy (CORS proxy or stream relay). A `{url}` placeholder is replaced with the
+ * encoded target; a proxy ending in `=` (e.g. `https://proxy.example/?url=`) gets the encoded target
+ * appended; a bare origin (`https://relay.example.deno.dev`) uses the relay's query form
+ * (`https://relay.example.deno.dev/?url=` + encoded target); any other proxy is used as a plain prefix
+ * (`https://proxy.example/` + target). Returns '' when the result isn't an http(s) URL.
  * @param {string} proxy
  * @param {string} targetUrl
  * @returns {string}
  */
 export function buildProxyUrl(proxy, targetUrl) {
-  const base = typeof proxy === 'string' ? proxy.trim() : '';
-  if (!base) return '';
+  const form = proxyForm(proxy);
+  if (!form) return '';
   let result;
-  if (/\{url\}/i.test(base)) result = base.replace(/\{url\}/gi, encodeURIComponent(targetUrl));
-  else if (base.endsWith('=')) result = base + encodeURIComponent(targetUrl);
-  else result = base + targetUrl;
+  if (form.kind === 'template') result = form.base.replace(/\{url\}/gi, encodeURIComponent(targetUrl));
+  else if (form.kind === 'encoded') result = form.prefix + encodeURIComponent(targetUrl);
+  else result = form.prefix + targetUrl;
   const parsed = tryParseUrl(result);
   return parsed && (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? result : '';
+}
+
+/**
+ * True when `url` already is a request through `proxy` — it starts with what buildProxyUrl() puts before the
+ * target (e.g. a segment URL in a playlist the relay rewrote) — so it must not be wrapped again. Scheme and
+ * host compare case-insensitively (relays build their URLs from the parsed request URL).
+ * @param {string} url
+ * @param {string} proxy
+ * @returns {boolean}
+ */
+export function isProxiedUrl(url, proxy) {
+  const form = proxyForm(proxy);
+  const value = typeof url === 'string' ? url.trim() : '';
+  if (!form || !value || !/^https?:\/\/[^/?#]/i.test(form.prefix)) return false;
+  return value.startsWith(form.prefix) || normalizeOrigin(value).startsWith(normalizeOrigin(form.prefix));
+}
+
+/** `value` with its scheme and host normalized as the URL parser does (lower case, no default port). */
+function normalizeOrigin(value) {
+  const match = /^([a-z][a-z0-9+.-]*:\/\/[^/?#]*)([\s\S]*)$/i.exec(value);
+  const url = match && tryParseUrl(match[1]);
+  return url && (url.protocol === 'http:' || url.protocol === 'https:') ? url.origin + match[2] : value;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -176,7 +221,8 @@ export function buildProxyUrl(proxy, targetUrl) {
  *   first; if that fails and a `corsProxy` is set, the proxy is tried with the ORIGINAL url; otherwise
  *   'MIXED_CONTENT' is thrown.
  * - A network/CORS failure (fetch TypeError) is retried through `corsProxy` when set, else 'CORS' is thrown
- *   ('NETWORK' when the browser reports being offline).
+ *   ('NETWORK' when the browser reports being offline). A URL that already goes through `corsProxy` is never
+ *   wrapped again.
  * - `timeoutMs` bounds the wait for the response headers and every pause between body chunks (a slow but
  *   steady download of a big playlist is not cut off; a stalled one is). 0/Infinity disables it.
  * - The body is streamed with a `maxBytes` cap ('TOO_LARGE'), decoded as UTF-8 (windows-1252 fallback when the
@@ -205,7 +251,7 @@ export async function fetchPlaylist(
   const target = normalizePlaylistUrl(url);
   throwIfAborted(signal);
   const settings = { signal, timeoutMs: sanitizeTimeout(timeoutMs), maxBytes: sanitizeMaxBytes(maxBytes) };
-  const proxyUrl = buildProxyUrl(corsProxy, target);
+  const proxyUrl = isProxiedUrl(target, corsProxy) ? '' : buildProxyUrl(corsProxy, target);
   const parsed = new URL(target);
   const mixed = pageProtocol === 'https:' && parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname);
 
@@ -572,12 +618,12 @@ const sizeLabel = (bytes) => formatBytes(bytes).replace(/\.0 /, ' ');
 /** Join sentences, skipping empty parts. */
 const say = (...sentences) => sentences.filter(Boolean).join(' ');
 
-const UPLOAD_OR_PROXY = 'download the file and upload it here, or set up a CORS proxy in Settings';
+const UPLOAD_OR_PROXY = 'download the file and upload it here, or set up a relay in Settings';
 const EXAMPLE_URL = 'https://example.com/playlist.m3u';
 
 function httpMessage(status, statusText, viaProxy) {
   const label = status ? `HTTP ${status}${statusText ? ` ${statusText}` : ''}` : 'an HTTP error';
-  const proxyNote = viaProxy && 'The request went through your CORS proxy — check its address in Settings.';
+  const proxyNote = viaProxy && 'The download went through the relay (Settings → Network).';
   let text;
   if (status === 401 || status === 403) {
     text = say(
@@ -587,7 +633,7 @@ function httpMessage(status, statusText, viaProxy) {
   } else if (status === 404 || status === 410) {
     text = `The playlist wasn't found (${label}). Check that the link is correct and still active.`;
   } else if (status === 407) {
-    text = `A proxy requires authentication (${label}). Check your network or CORS proxy settings.`;
+    text = `A proxy requires authentication (${label}). Check your network or relay settings.`;
   } else if (status === 408 || status === 504 || status === 524) {
     text = `The server took too long to respond (${label}). Try again in a moment.`;
   } else if (status === 429) {
@@ -630,8 +676,9 @@ function buildMessage(code, details = {}) {
       if (offline) return 'You appear to be offline. Check your internet connection and try again.';
       if (viaProxy) {
         return say(
-          "Couldn't download the playlist, not even through your CORS proxy.",
-          'Check the link and the proxy address in Settings, or download the file and upload it here.',
+          "Couldn't download the playlist, not even through the relay.",
+          'Check the link (and, if you use your own relay, its address in Settings → Network), or download the',
+          'file and upload it here.',
         );
       }
       if (reason === 'interrupted') {

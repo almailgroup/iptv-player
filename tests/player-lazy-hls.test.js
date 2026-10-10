@@ -2,16 +2,20 @@
 // when it can't be loaded. Each test gets fresh module state (vi.resetModules) so the import cache is empty.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const ctl = vi.hoisted(() => ({ imports: 0, fail: false, gate: null, instances: [] }));
+const ctl = vi.hoisted(() => ({ imports: 0, fail: false, gate: null, instances: [], noLoader: false }));
 
 // Registered per test (vi.doMock + vi.resetModules) so every test starts with hls.js not yet imported.
 const hlsFactory = async () => {
   ctl.imports += 1;
   if (ctl.gate) await ctl.gate;
   if (ctl.fail) throw new Error('Failed to fetch dynamically imported module');
+  class FakeLoader {}
   class FakeHls {
     static isSupported() {
       return true;
+    }
+    static get DefaultConfig() {
+      return ctl.noLoader ? {} : { loader: FakeLoader };
     }
     static Events = { ERROR: 'hlsError', MANIFEST_PARSED: 'hlsManifestParsed' };
     static ErrorTypes = { NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError' };
@@ -58,7 +62,7 @@ async function setup(videoOptions) {
 beforeEach(() => {
   vi.resetModules();
   vi.doMock('hls.js', hlsFactory);
-  Object.assign(ctl, { imports: 0, fail: false, gate: null, instances: [] });
+  Object.assign(ctl, { imports: 0, fail: false, gate: null, instances: [], noLoader: false });
 });
 
 afterEach(() => {
@@ -136,6 +140,30 @@ describe('Player — lazy hls.js', () => {
     await flush();
     expect(player.state).toBe('error');
     expect(player.error).toMatchObject({ code: 'UNKNOWN', message: 'Couldn’t load the HLS player.' });
+  });
+
+  it('builds the relay loader from the lazily loaded hls.js', async () => {
+    await setup();
+    player.setOptions({ streamProxy: 'https://relay.example' });
+    await player.load({ url: 'http://1.2.3.4/live/index.m3u8' });
+    expect(ctl.imports).toBe(1);
+    expect(ctl.instances).toHaveLength(1);
+    expect(ctl.instances[0].config.loader).toBeTypeOf('function');
+    expect(ctl.instances[0].url).toBe('http://1.2.3.4/live/index.m3u8');
+    expect(player.viaProxy).toBe(true);
+  });
+
+  it('falls back to native HLS when hls.js offers no loader to relay through', async () => {
+    ctl.noLoader = true;
+    await setup({ nativeHls: 'maybe' });
+    player.setOptions({ streamProxy: 'https://relay.example' });
+    await player.load({ url: 'http://1.2.3.4/live/index.m3u8' });
+    await flush();
+    expect(ctl.instances).toHaveLength(0);
+    expect(player.engine).toBe('native');
+    expect(player.video.getAttribute('src')).toBe(
+      `https://relay.example/?url=${encodeURIComponent('http://1.2.3.4/live/index.m3u8')}`,
+    );
   });
 
   it('times out an hls.js import that never settles', async () => {

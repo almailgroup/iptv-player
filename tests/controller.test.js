@@ -195,9 +195,29 @@ vi.mock('../src/lib/utils.js', async (importOriginal) => ({
   downloadText: vi.fn(),
 }));
 
+// A built-in relay as a deployed site has one (a plain build has none).
+vi.mock('../src/app/constants.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  BUILTIN_RELAY_URL: 'https://builtin-relay.example.test',
+}));
+
 import { createStore } from '../src/app/store.js';
-import { createController, createInitialState } from '../src/app/controller.js';
-import { CATEGORY, DEFAULT_SETTINGS, KEYS, MAX_RECENTS, UNCATEGORIZED } from '../src/app/constants.js';
+import {
+  HEALTH_TTL_MS,
+  createController,
+  createInitialState,
+  sanitizeHealth,
+  sanitizeSettings,
+} from '../src/app/controller.js';
+import {
+  BUILTIN_RELAY_URL,
+  CATEGORY,
+  DEFAULT_SETTINGS,
+  KEYS,
+  MAX_RECENTS,
+  UNCATEGORIZED,
+  normalizeBuiltinRelay,
+} from '../src/app/constants.js';
 import { DEMO_PLAYLIST_NAME } from '../src/app/demo.js';
 import { channelToSnapshot } from '../src/app/selectors.js';
 import { PlaylistLoadError, fetchPlaylist } from '../src/lib/playlist-loader.js';
@@ -1025,6 +1045,392 @@ describe('playlist management', () => {
     expect(store.get().category).toBe('all');
     actions.setCategory('group:Kids');
     expect(store.get().category).toBe('group:Kids');
+  });
+});
+
+describe('channel health', () => {
+  const NOW = Date.UTC(2026, 9, 9, 12);
+  const entry = (at, code = 'NETWORK', title = 'Lost connection to the stream.') => ({ code, title, at });
+  const channel = (id) => ({ id, name: id, url: `https://tv.example/${id}.m3u8` });
+
+  it('loads remembered failures with strict sanitizing and a 12 h TTL', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const stored = JSON.parse(
+      JSON.stringify({
+        fresh: entry(NOW - 1000),
+        edge: entry(NOW - HEALTH_TTL_MS),
+        expired: entry(NOW - HEALTH_TTL_MS - 1),
+        future: entry(NOW + 3_600_000),
+        skewed: entry(NOW + 30_000),
+        longest: entry(NOW, 'C'.repeat(32), 't'.repeat(120)),
+        longCode: entry(NOW, 'C'.repeat(33)),
+        longTitle: entry(NOW, 'NETWORK', 't'.repeat(121)),
+        numberCode: entry(NOW, 5),
+        noTitle: { code: 'HTTP', at: NOW },
+        stringAt: entry(String(NOW)),
+        nullAt: entry(null),
+        extra: { ...entry(NOW - 5), junk: { deep: true } },
+        text: 'NETWORK',
+        list: [entry(NOW)],
+      }),
+    );
+    mem.json.set(KEYS.health, JSON.parse(`{"__proto__": ${JSON.stringify(entry(NOW))}, ${JSON.stringify(stored).slice(1)}`));
+
+    const { health } = createInitialState();
+    expect(health).toEqual({
+      fresh: entry(NOW - 1000),
+      edge: entry(NOW - HEALTH_TTL_MS),
+      skewed: entry(NOW + 30_000),
+      longest: entry(NOW, 'C'.repeat(32), 't'.repeat(120)),
+      extra: entry(NOW - 5),
+    });
+    expect(Object.getPrototypeOf(health)).toBe(Object.prototype);
+    expect(Object.hasOwn(health, '__proto__')).toBe(false);
+
+    for (const raw of [null, 'x', 5, [entry(NOW)]]) expect(sanitizeHealth(raw, NOW)).toEqual({});
+    mem.json.delete(KEYS.health);
+    expect(createInitialState().health).toEqual({});
+  });
+
+  it('keeps the newest 1500 entries', () => {
+    const raw = {};
+    for (let i = 0; i < 1600; i++) raw[`c${i}`] = entry(NOW - i * 1000);
+    const health = sanitizeHealth(raw, NOW);
+    expect(Object.keys(health)).toHaveLength(1500);
+    expect(health.c0).toEqual(entry(NOW));
+    expect(health.c1499).toBeDefined();
+    expect(health.c1500).toBeUndefined();
+  });
+
+  it('records failures (sanitized, updated in place) and forgets them once a channel plays', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const { store, actions } = setup();
+    expect(store.get().health).toEqual({});
+
+    actions.markChannelFailed(channel('a'), { code: 'NETWORK', title: '  Lost   connection\nto the stream. ' });
+    expect(store.get().health).toEqual({ a: entry(NOW, 'NETWORK', 'Lost connection to the stream.') });
+
+    vi.setSystemTime(NOW + 60_000);
+    actions.markChannelFailed(channel('a'), { code: 'HTTP', title: 'Access denied (403).' });
+    actions.markChannelFailed(channel('b'), { code: 'X'.repeat(40), title: 'y'.repeat(200) });
+    actions.markChannelFailed(channel('c'));
+    expect(store.get().health).toEqual({
+      a: entry(NOW + 60_000, 'HTTP', 'Access denied (403).'),
+      b: entry(NOW + 60_000, 'X'.repeat(32), 'y'.repeat(120)),
+      c: entry(NOW + 60_000, '', 'This channel didn’t play the last time it was tried.'),
+    });
+
+    const before = store.get().health;
+    for (const bad of [null, {}, { id: 5 }, { id: '' }, { id: '__proto__' }]) actions.markChannelFailed(bad);
+    expect(store.get().health).toBe(before);
+
+    actions.markChannelOk(channel('a'));
+    expect(Object.keys(store.get().health)).toEqual(['b', 'c']);
+    actions.clearHealth();
+    expect(store.get().health).toEqual({});
+  });
+
+  it('markChannelOk / clearHealth leave the state untouched when there is nothing to forget', () => {
+    const { store, actions } = setup();
+    actions.markChannelFailed(channel('a'), { code: 'NETWORK', title: 'Gone.' });
+    const before = store.get();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    actions.markChannelOk(channel('other'));
+    actions.markChannelOk({ id: 'toString' });
+    actions.markChannelOk(null);
+    expect(store.get()).toBe(before);
+    expect(store.get().health).toBe(before.health);
+
+    actions.clearHealth();
+    const cleared = store.get();
+    actions.clearHealth();
+    expect(store.get()).toBe(cleared);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops expired entries and keeps the newest 1500 when recording a failure', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const raw = { stale: entry(NOW - 3_600_000) };
+    for (let i = 0; i < 1500; i++) raw[`c${i}`] = entry(NOW - i);
+    mem.json.set(KEYS.health, raw);
+    const { store, actions } = setup();
+    const loaded = store.get().health;
+    expect(Object.keys(loaded)).toHaveLength(1500);
+    expect(loaded.stale).toBeUndefined(); // the oldest of 1501 → capped away
+
+    actions.markChannelFailed(channel('new'), { code: 'NETWORK', title: 'Gone.' });
+    const health = store.get().health;
+    expect(Object.keys(health)).toHaveLength(1500);
+    expect(health.new).toEqual(entry(NOW, 'NETWORK', 'Gone.'));
+    expect(health.c1499).toBeUndefined(); // now the oldest
+    expect(health.c0).toBe(loaded.c0); // other entries are kept as they are
+
+    vi.setSystemTime(NOW + HEALTH_TTL_MS + 1);
+    actions.markChannelFailed(channel('later'), { code: 'HTTP', title: 'Later.' });
+    expect(store.get().health).toEqual({ later: entry(NOW + HEALTH_TTL_MS + 1, 'HTTP', 'Later.') });
+  });
+
+  it('drops failures that expired while the tab was in the background', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const { store, actions } = setup();
+    actions.markChannelFailed(channel('a'), { code: 'NETWORK', title: 'Gone.' });
+    vi.setSystemTime(NOW + 3_600_000);
+    actions.markChannelFailed(channel('b'), { code: 'NETWORK', title: 'Gone.' });
+    const before = store.get().health;
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(store.get().health).toBe(before); // nothing expired yet
+
+    vi.setSystemTime(NOW + HEALTH_TTL_MS + 1);
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(Object.keys(store.get().health)).toEqual(['b']);
+  });
+
+  it('persists debounced (500 ms) and flushes on pagehide and destroy', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const { store, actions } = setup();
+    storage.writeJSON.mockClear();
+
+    actions.markChannelFailed(channel('a'), { code: 'NETWORK', title: 'Gone.' });
+    actions.markChannelFailed(channel('b'), { code: 'HTTP', title: 'Denied.' });
+    await vi.advanceTimersByTimeAsync(499);
+    expect(writesFor(KEYS.health)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(writesFor(KEYS.health)).toHaveLength(1);
+    expect(lastWrite(KEYS.health)).toEqual(store.get().health);
+
+    window.dispatchEvent(new Event('pagehide')); // nothing pending → no write
+    expect(writesFor(KEYS.health)).toHaveLength(1);
+    actions.markChannelOk(channel('a'));
+    window.dispatchEvent(new Event('pagehide'));
+    expect(writesFor(KEYS.health)).toHaveLength(2);
+    expect(lastWrite(KEYS.health)).toEqual({ b: entry(NOW, 'HTTP', 'Denied.') });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(writesFor(KEYS.health)).toHaveLength(2);
+
+    actions.clearHealth();
+    actions.destroy();
+    expect(writesFor(KEYS.health)).toHaveLength(3);
+    expect(lastWrite(KEYS.health)).toEqual({});
+    // A reload starts from what was saved.
+    expect(createInitialState().health).toEqual({});
+  });
+
+  it('adopts failures saved by another tab without writing them back', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const { store, actions } = setup();
+    actions.markChannelFailed(channel('mine'), { code: 'NETWORK', title: 'Gone.' }); // write still pending
+    const remote = { theirs: entry(NOW - 5), bad: { code: 1 }, old: entry(NOW - HEALTH_TTL_MS - 1) };
+    mem.json.set(KEYS.health, remote);
+    storage.writeJSON.mockClear();
+
+    window.dispatchEvent(new StorageEvent('storage', { key: KEYS.health, newValue: JSON.stringify(remote) }));
+    expect(store.get().health).toEqual({ theirs: entry(NOW - 5) });
+    await vi.advanceTimersByTimeAsync(1000);
+    window.dispatchEvent(new Event('pagehide'));
+    expect(writesFor(KEYS.health)).toHaveLength(0);
+
+    // The same content again is not a change.
+    const adopted = store.get().health;
+    window.dispatchEvent(new StorageEvent('storage', { key: KEYS.health, newValue: JSON.stringify(remote) }));
+    expect(store.get().health).toBe(adopted);
+
+    // Local changes after that are saved as usual.
+    actions.markChannelFailed(channel('next'), { code: 'HTTP', title: 'Denied.' });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(lastWrite(KEYS.health)).toEqual({ theirs: entry(NOW - 5), next: entry(NOW + 1000, 'HTTP', 'Denied.') });
+  });
+
+  it('accepts the relay / playability settings', () => {
+    mem.json.set(KEYS.settings, { useBuiltinRelay: false, hideUnplayable: 1, proxyStreams: 'no' });
+    expect(createInitialState().settings).toMatchObject({ useBuiltinRelay: false, hideUnplayable: true, proxyStreams: true });
+    const { store, actions } = setup();
+    actions.updateSettings({ hideUnplayable: false, useBuiltinRelay: 'yes' });
+    expect(store.get().settings).toMatchObject({ hideUnplayable: false, useBuiltinRelay: false });
+    actions.updateSettings({ useBuiltinRelay: true, hideUnplayable: true });
+    expect(store.get().settings).toMatchObject({ hideUnplayable: true, useBuiltinRelay: true });
+    expect(lastWrite(KEYS.settings)).toEqual(store.get().settings);
+  });
+
+  it('keeps a playlist proxy from the previous release off the streams', () => {
+    // That release used corsProxy for playlist downloads only, and saved no proxyStreams setting.
+    const legacy = { autoplay: true, corsProxy: 'https://corsproxy.io/?url=' };
+    expect(sanitizeSettings(legacy)).toMatchObject({ corsProxy: 'https://corsproxy.io/?url=', proxyStreams: false });
+    mem.json.set(KEYS.settings, legacy);
+    expect(createInitialState().settings).toMatchObject({ corsProxy: legacy.corsProxy, proxyStreams: false });
+
+    // Saved by this release (proxyStreams is always written), or nothing to migrate: as stored / the default.
+    expect(sanitizeSettings({ ...legacy, proxyStreams: true }).proxyStreams).toBe(true);
+    expect(sanitizeSettings({ ...legacy, proxyStreams: 'yes' }).proxyStreams).toBe(true); // invalid → default
+    expect(sanitizeSettings({ autoplay: true }).proxyStreams).toBe(true);
+    expect(sanitizeSettings({ corsProxy: '  ' }).proxyStreams).toBe(true);
+    expect(sanitizeSettings({ corsProxy: 'ftp://not-a-relay' }).proxyStreams).toBe(true);
+    expect(sanitizeSettings(Object.assign(Object.create({ proxyStreams: true }), legacy)).proxyStreams).toBe(false);
+
+    // Once saved again, the migrated value sticks — until the user turns streams on.
+    const { store, actions } = setup();
+    actions.updateSettings({ autoplay: false });
+    expect(lastWrite(KEYS.settings)).toMatchObject({ corsProxy: legacy.corsProxy, proxyStreams: false });
+    actions.updateSettings({ proxyStreams: true });
+    expect(sanitizeSettings(lastWrite(KEYS.settings)).proxyStreams).toBe(true);
+    expect(store.get().settings.proxyStreams).toBe(true);
+  });
+
+  it('migrates settings another tab of the previous release saves', () => {
+    const { store } = setup();
+    mem.json.set(KEYS.settings, { corsProxy: 'https://corsproxy.io/?url=' });
+    window.dispatchEvent(new StorageEvent('storage', { key: KEYS.settings }));
+    expect(store.get().settings).toMatchObject({ corsProxy: 'https://corsproxy.io/?url=', proxyStreams: false });
+  });
+
+  it('playNext / playPrev skip hidden unplayable channels but keep the current one', async () => {
+    respondWith();
+    const { store, actions } = setup();
+    await actions.addPlaylistFromUrl({ url: URL_A });
+    actions.updateSettings({ hideUnplayable: true });
+    const name = () => store.get().currentChannel?.name;
+
+    actions.playChannel(byName(store, 'News One'));
+    actions.markChannelFailed(byName(store, 'News Two'), { code: 'NETWORK', title: 'Gone.' });
+    actions.playNext();
+    expect(name()).toBe('Sport One');
+
+    // The current channel failing keeps it in the list, so stepping continues from it.
+    actions.markChannelFailed(byName(store, 'Sport One'), { code: 'NETWORK', title: 'Gone.' });
+    actions.playNext();
+    expect(name()).toBe('Cartoon Time');
+    actions.playPrev();
+    expect(name()).toBe('News One');
+    actions.markChannelOk(byName(store, 'News Two'));
+    actions.playNext();
+    expect(name()).toBe('News Two');
+  });
+});
+
+describe('relay for playlist downloads', () => {
+  const OWN = 'https://own-relay.example.test/';
+  const relays = () => fetchPlaylist.mock.calls.map(([, options]) => options?.corsProxy);
+
+  it('downloads through the built-in relay unless the user has their own or switched it off', async () => {
+    respondWith();
+    const { store, actions } = setup();
+    const meta = await actions.addPlaylistFromUrl({ url: URL_A });
+    expect(BUILTIN_RELAY_URL).toBe('https://builtin-relay.example.test');
+    expect(relays()).toEqual([BUILTIN_RELAY_URL]);
+
+    actions.updateSettings({ corsProxy: OWN });
+    await actions.refreshPlaylist(meta.id);
+    actions.updateSettings({ corsProxy: '', useBuiltinRelay: false });
+    await actions.refreshPlaylist(meta.id);
+    actions.updateSettings({ useBuiltinRelay: true, proxyStreams: false }); // streams only — playlists still use it
+    await actions.refreshPlaylist(meta.id);
+    expect(relays()).toEqual([BUILTIN_RELAY_URL, OWN, '', BUILTIN_RELAY_URL]);
+    expect(store.get().settings.corsProxy).toBe('');
+  });
+
+  it('uses the effective relay for start-up downloads, exports and background refreshes', async () => {
+    vi.useFakeTimers();
+    respondWith();
+    mem.json.set(KEYS.settings, { corsProxy: OWN });
+    seedPlaylist({ id: 'pl_uncached', url: URL_A, text: null });
+    seedPlaylist({ id: 'pl_stale', url: URL_B, updatedAt: 0 });
+    seedPlaylist({ id: 'pl_export', url: 'https://lists.example/c/export.m3u', text: null });
+    mem.json.set(KEYS.session, { activePlaylistId: 'pl_uncached' });
+    const { actions } = setup();
+    await actions.init(); // downloads the uncached active playlist
+    expect(relays()).toEqual([OWN]);
+
+    await actions.exportPlaylist('pl_export'); // not stored → downloaded for the export
+    expect(relays()).toEqual([OWN, OWN]);
+
+    actions.updateSettings({ corsProxy: '' });
+    await actions.switchPlaylist('pl_stale'); // cached but stale → re-downloaded in the background
+    expect(relays()).toEqual([OWN, OWN]);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(relays()).toEqual([OWN, OWN, BUILTIN_RELAY_URL]);
+  });
+});
+
+describe('built-in relay setting (constants)', () => {
+  const RELAY = 'https://iptv-relay.example.deno.dev';
+
+  it.each([
+    [RELAY, RELAY],
+    [`  ${RELAY}  `, RELAY],
+    ['HTTPS://Relay.Example.Test/?url=', 'HTTPS://Relay.Example.Test/?url='], // kept as written (buildProxyUrl forms)
+    ['https://relay.example.test/{url}', 'https://relay.example.test/{url}'],
+    ['http://localhost:8787', 'http://localhost:8787'],
+    ['http://127.0.0.1:8787/', 'http://127.0.0.1:8787/'],
+    ['http://[::1]:8787', 'http://[::1]:8787'],
+  ])('accepts %j', (value, expected) => {
+    const warn = vi.fn();
+    expect(normalizeBuiltinRelay(value, warn)).toBe(expected);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '   ', 'off', 'OFF', 'Off', ' off ', 'false', 'FALSE', 'none', 'None', '0', undefined, null])(
+    'treats %j as no built-in relay, quietly',
+    (value) => {
+      const warn = vi.fn();
+      expect(normalizeBuiltinRelay(value, warn)).toBe('');
+      expect(warn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    'iptv-relay.example.deno.dev', // no scheme
+    'http://iptv-relay.example.deno.dev', // insecure: browsers block it on the https site
+    'http://192.168.1.10:8787',
+    'http://127.0.0.2:8787',
+    'ftp://relay.example.test/',
+    'https://user:secret@relay.example.test/',
+    'https://',
+    'no',
+  ])('refuses %j with a warning', (value) => {
+    const warn = vi.fn();
+    expect(normalizeBuiltinRelay(value, warn)).toBe('');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(JSON.stringify(value.trim()));
+  });
+
+  describe('BUILTIN_RELAY_URL', () => {
+    /** constants.js as a build with this VITE_BUILTIN_RELAY evaluates it. */
+    async function loadWith(env) {
+      if (env !== undefined) vi.stubEnv('VITE_BUILTIN_RELAY', env);
+      vi.resetModules();
+      return vi.importActual('../src/app/constants.js');
+    }
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    });
+
+    it('takes the build variable when it is usable, and "off" in any case disables it', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      expect((await loadWith(RELAY)).BUILTIN_RELAY_URL).toBe(RELAY);
+      for (const off of ['off', 'OFF', 'False', 'none', '0']) {
+        expect((await loadWith(off)).BUILTIN_RELAY_URL, off).toBe('');
+      }
+      expect((await loadWith('')).BUILTIN_RELAY_URL).toBe(''); // DEFAULT_BUILTIN_RELAY (none in this repo)
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('drops an unusable value with one warning when the module loads', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const constants = await loadWith('iptv-relay.example.deno.dev');
+      expect(constants.BUILTIN_RELAY_URL).toBe('');
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toMatch(/built-in relay/i);
+      expect(constants.BUILTIN_RELAY_URL).toBe(''); // reading it again doesn't warn again
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
   });
 });
 

@@ -1,6 +1,9 @@
 // Playback engine: wraps a <video> element and picks the right engine per stream (hls.js, mpegts.js or the
 // browser's native player), classifies failures into actionable errors, and keeps live channels alive with
 // engine fallback, auto-reconnect (exponential backoff + jitter), a stall watchdog and offline handling.
+// Streams that browsers block (insecure http:// on https pages, servers without CORS headers) can play
+// through a stream relay (`streamProxy`, see proxy/README.md): every engine then requests through it. Streams
+// on this computer or the local network never use it — a relay on the internet can't reach them.
 //
 // Every engine "run" gets a load token. All async continuations, engine callbacks and timers check it, so
 // rapid channel switching never leaks engines, timers or listeners, and never applies stale events.
@@ -8,11 +11,13 @@
 // hls.js itself is loaded on demand (see loadHls()), so the app shell starts without it. The worker URL is a
 // plain asset URL: hls.js' ESM build only transmuxes in a Web Worker when given one (same origin, CSP-safe).
 import hlsWorkerUrl from 'hls.js/dist/hls.worker.js?url';
+import { buildProxyUrl, isProxiedUrl } from '../lib/playlist-loader.js';
 import { formatBitrate, tryParseUrl } from '../lib/utils.js';
 import {
   backoffDelay,
   detectStreamType,
   isMixedContent,
+  isPrivateNetworkUrl,
   sniffStreamType,
   upgradeToHttps,
 } from './stream-type.js';
@@ -63,6 +68,11 @@ export const DEFAULT_PLAYER_OPTIONS = Object.freeze({
   sniffTimeoutMs: 5000,
   /** Page protocol used for mixed-content checks; defaults to `location.protocol` (injectable for tests). */
   pageProtocol: undefined,
+  /** The stream relay (same formats as buildProxyUrl(); '' disables it). Insecure http:// streams on https
+   * pages play through it — after a quick try of their https version when `upgradeInsecure` is on and the
+   * host is a name, not an IP address; other streams switch to it once when they fail with a CORS / network
+   * error before the first frame. Local-network streams never use it. Read when a source is loaded. */
+  streamProxy: '',
 });
 
 const S = PlayerState;
@@ -92,6 +102,14 @@ const loadPolicy = (maxTimeToFirstByteMs, maxLoadTimeMs, maxNumRetry, timeoutRet
   },
 });
 
+/** Time to first byte allowed for the manifest of an insecure stream's https version when the relay is the
+ * fallback: hosts without https usually refuse the connection at once, or let it hang. */
+const UPGRADE_PROBE_TTFB_MS = 5000;
+/** Max time from engine start to first frame on that https version (any engine: native and mpegts.js have
+ * no time-to-first-byte limit, so a host that silently drops the connection would otherwise hold the relay
+ * up for the whole loadTimeoutMs). */
+const UPGRADE_PROBE_LOAD_MS = 10000;
+
 const HLS_BASE_CONFIG = Object.freeze({
   enableWorker: true,
   backBufferLength: 30,
@@ -104,11 +122,13 @@ const HLS_BASE_CONFIG = Object.freeze({
   progressive: false,
 });
 
-function hlsConfig({ lowLatency, startPosition }) {
+/** `probe`: loading an insecure stream's https version with the relay to fall back to — fail fast (no manifest
+ * retries, short time to first byte). */
+function hlsConfig({ lowLatency, startPosition, probe = false }) {
   const config = {
     ...HLS_BASE_CONFIG,
     lowLatencyMode: !!lowLatency,
-    manifestLoadPolicy: loadPolicy(Infinity, 20000, 2, 1000),
+    manifestLoadPolicy: probe ? loadPolicy(UPGRADE_PROBE_TTFB_MS, 20000, 0) : loadPolicy(Infinity, 20000, 2, 1000),
     playlistLoadPolicy: loadPolicy(10000, 20000, 4),
     fragLoadPolicy: loadPolicy(10000, 120000, 6),
   };
@@ -130,10 +150,13 @@ const MPEGTS_CONFIG = Object.freeze({
 
 /** Error codes that mean "couldn't reach / fetch it" — used to decide whether an https upgrade failed. */
 const NETWORKISH = new Set([E.CORS, E.NETWORK, E.HTTP, E.MANIFEST, E.UNKNOWN]);
+/** Error codes that may come from the stream relay itself (down, refusing, answering with an error page). */
+const RELAY_SUSPECTS = new Set([E.CORS, E.NETWORK, E.HTTP, E.MANIFEST]);
 
 // ---------------------------------------------------------------------------------------------------------
 // Failure classification. A "failure" is internal: it carries routing hints (retryable, nextEngine…).
-// The public error (player.error / 'error' event) is { code, message, detail?, status?, technical?, fatal }.
+// The public error (player.error / 'error' event) is { code, message, detail?, status?, technical?, fatal,
+// viaProxy?, canUseProxy?, localNetwork? }.
 // ---------------------------------------------------------------------------------------------------------
 
 const RANK = {
@@ -153,6 +176,9 @@ const RANK = {
  * @property {boolean} ambiguous    native "src not supported" (browsers also report 404/TLS failures this way)
  * @property {number} rank          informativeness when every engine failed
  * @property {string} reason        short machine-readable reason ('stalled', 'timeout', 'cors'…)
+ * @property {boolean} [viaProxy]   it happened while requesting through the stream relay
+ * @property {boolean} [canUseProxy] a stream relay would likely fix it and none is configured
+ * @property {boolean} [localNetwork] blocked (mixed content / CORS), and on the local network: no relay helps
  */
 
 /** @returns {Failure} */
@@ -180,6 +206,9 @@ const MSG = {
   mixedUpgradeDetail:
     'The HTTPS version of this link didn’t work either. Use an HTTPS stream URL if your provider offers one, ' +
     'or run the player locally over http:// (for example on your own computer) to play insecure streams.',
+  mixedLocalDetail:
+    'This stream is on your local network. Browsers block insecure streams on secure sites; open the player ' +
+    'over http on your network (e.g. run it locally) to watch it.',
   drm: 'DRM-protected channels are not supported in the browser player.',
   drmDetail: 'This channel needs a license (Widevine/PlayReady). Open it in your provider’s official app.',
   dash: 'MPEG-DASH streams are not supported.',
@@ -214,6 +243,8 @@ const MSG = {
   noHlsDetail: 'Update your browser, or try a recent version of Chrome, Edge, Firefox or Safari.',
   noMse: 'Your browser can’t play MPEG-TS/FLV streams.',
   unknown: 'Something went wrong while playing this stream.',
+  proxy: 'Couldn’t play this stream through the relay.',
+  proxyDetail: 'Check that the relay is running and its address is correct (Settings → Network), or try again later.',
 };
 
 function protocolFailure(url) {
@@ -281,12 +312,38 @@ const mediaFailure = (technical, nextEngine = true) =>
 const networkFailure = (message, reason, technical = '') =>
   failure(E.NETWORK, message, { detail: MSG.networkDetail, technical, retryable: true, reason });
 
-function mixedContentFailure(upgradeTried, technical = '') {
-  return failure(E.MIXED_CONTENT, MSG.mixed, {
-    detail: upgradeTried ? MSG.mixedUpgradeDetail : MSG.mixedDetail,
-    technical,
-    reason: 'mixed-content',
-  });
+function mixedContentFailure(upgradeTried, technical = '', localNetwork = false) {
+  let detail = upgradeTried ? MSG.mixedUpgradeDetail : MSG.mixedDetail;
+  if (localNetwork) detail = MSG.mixedLocalDetail;
+  return failure(E.MIXED_CONTENT, MSG.mixed, { detail, technical, reason: 'mixed-content' });
+}
+
+/** True when `url`'s host is an IP address. Those almost never have a valid TLS certificate, so trying an
+ * insecure stream's https version is pointless there. */
+function hasIpHost(url) {
+  const host = tryParseUrl(url)?.hostname || '';
+  return host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host);
+}
+
+/** "The browser couldn't fetch it": blocked by CORS, unreachable, or refused (401/403, often an
+ * Origin/Referer check). A relay — which fetches server-side without browser headers — may get through. */
+function isReachabilityFailure(f) {
+  if (f.code === E.CORS || f.code === E.NETWORK) return true;
+  if (f.code === E.HTTP) return f.status === 401 || f.status === 403;
+  return f.code === E.MANIFEST && f.status === 0;
+}
+
+/** A reachability failure through the relay before the first frame: point at the relay (keeping an HTTP
+ * status) and retry only a little — the relay itself is the likely problem. */
+function proxyFailure(cause) {
+  return {
+    ...cause,
+    code: cause.code === E.HTTP ? E.HTTP : E.NETWORK,
+    message: MSG.proxy,
+    detail: MSG.proxyDetail,
+    maxRetries: Math.min(cause.maxRetries, LIMITED_RETRIES),
+    viaProxy: true,
+  };
 }
 
 /** Most informative failure (highest rank; ties → most recent). */
@@ -301,6 +358,9 @@ function toPublicError(f, fatal = true) {
   if (f.detail) error.detail = f.detail;
   if (Number.isFinite(f.status)) error.status = f.status;
   if (f.technical) error.technical = f.technical;
+  if (f.viaProxy) error.viaProxy = true;
+  if (f.canUseProxy) error.canUseProxy = true;
+  if (f.localNetwork) error.localNetwork = true;
   return error;
 }
 
@@ -447,6 +507,119 @@ function resolveMpegts(mod) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Stream relay
+// ---------------------------------------------------------------------------------------------------------
+
+/** A usable relay setting, else '' (anything buildProxyUrl() can't turn into an http(s) request URL). */
+function normalizeProxy(value) {
+  const proxy = typeof value === 'string' ? value.trim() : '';
+  return proxy && buildProxyUrl(proxy, 'https://stream.invalid/') ? proxy : '';
+}
+
+/** `url` requested through `proxy`. Only http(s) URLs are relayed, and never twice (playlists the relay
+ * rewrote already point at it). */
+function proxify(proxy, url) {
+  if (!proxy || !/^https?:\/\//i.test(String(url ?? '')) || isProxiedUrl(url, proxy)) return url;
+  return buildProxyUrl(proxy, url) || url;
+}
+
+/** The context and callbacks hls.js passed to load(), as seen through the relay: callbacks get the original
+ * context object back (hls.js matches responses to requests by it) and the stream URL as `response.url`,
+ * so relative URIs resolve against the stream, not the relay. onAbort/onProgress stay absent when absent
+ * (their presence switches loader behavior, e.g. progressive fetch). */
+function relayCallbacks(callbacks, context) {
+  const wrapped = {
+    onSuccess: (response, stats, _ctx, details) =>
+      callbacks.onSuccess({ ...response, url: context.url }, stats, context, details),
+    onError: (error, _ctx, details, stats) => callbacks.onError(error, context, details, stats),
+    onTimeout: (stats, _ctx, details) => callbacks.onTimeout(stats, context, details),
+  };
+  if (callbacks.onAbort) {
+    wrapped.onAbort = (stats, _ctx, details) => callbacks.onAbort(stats, context, details);
+  }
+  if (callbacks.onProgress) {
+    wrapped.onProgress = (stats, _ctx, data, details) => callbacks.onProgress(stats, context, data, details);
+  }
+  return wrapped;
+}
+
+/** Relay loader classes, per hls.js default loader class and relay setting. */
+const relayLoaders = new WeakMap();
+
+/**
+ * An hls.js loader class (for `config.loader`) that sends every request — manifest, playlists, keys,
+ * segments — through `proxy`, using hls.js' default loader for the actual work (timeouts, retries, stats).
+ *
+ * It wraps the default loader, as hls.js' own CMCD loaders do, rather than extending it: hls.js reads
+ * `loader.context` (e.g. to skip a playlist request that is already in flight), so that must stay the
+ * context hls.js passed in, while the default loader keeps the relayed copy for its requests and retries.
+ * The class is cached, so every hls.js instance of a session shares it.
+ * @param {typeof import('hls.js').default} HlsCtor
+ * @param {string} proxy  relay setting (see buildProxyUrl)
+ * @returns {new (config: object) => object}
+ */
+export function makeProxyLoader(HlsCtor, proxy) {
+  const Base = HlsCtor?.DefaultConfig?.loader;
+  if (typeof Base !== 'function') throw new TypeError('hls.js has no default loader to relay through');
+  let byProxy = relayLoaders.get(Base);
+  if (!byProxy) {
+    byProxy = new Map();
+    relayLoaders.set(Base, byProxy);
+  }
+  let RelayLoader = byProxy.get(proxy);
+  if (RelayLoader) return RelayLoader;
+
+  RelayLoader = class {
+    #inner;
+    #context = null;
+
+    constructor(config) {
+      this.#inner = new Base(config);
+    }
+
+    /** The context passed to load() (not the relayed copy), as hls.js expects. */
+    get context() {
+      return this.#context;
+    }
+
+    get stats() {
+      return this.#inner.stats;
+    }
+
+    load(context, config, callbacks) {
+      const previous = this.#context;
+      this.#context = context;
+      try {
+        const relayed = { ...context, url: proxify(proxy, context.url) };
+        this.#inner.load(relayed, config, relayCallbacks(callbacks, context));
+      } catch (err) {
+        this.#context = previous; // e.g. "Loader can only be used once"
+        throw err;
+      }
+    }
+
+    abort() {
+      this.#inner.abort();
+    }
+
+    destroy() {
+      this.#inner.destroy();
+      this.#context = null;
+    }
+
+    getCacheAge() {
+      return typeof this.#inner.getCacheAge === 'function' ? this.#inner.getCacheAge() : null;
+    }
+
+    getResponseHeader(name) {
+      return typeof this.#inner.getResponseHeader === 'function' ? this.#inner.getResponseHeader(name) : null;
+    }
+  };
+  byProxy.set(proxy, RelayLoader);
+  return RelayLoader;
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Player
 // ---------------------------------------------------------------------------------------------------------
 
@@ -457,6 +630,9 @@ function resolveMpegts(mod) {
  *  'statechange' {state, prev, reason?}  'error' {error}  'reconnecting' {attempt, max, delayMs, reason, code}
  *  'levels' {levels, current}  'levelswitch' {level, auto, label}  'audiotracks' {tracks, current}
  *  'engine' {engine}  'autoplaymuted' {}  'live' {isLive}  'recovered' {}
+ *  'proxy' {reason}  — the load failed directly (reason: 'cors', 'http-403', 'timeout'…) — or as the https
+ *                      version of an insecure stream — and switched to the stream relay; not emitted for
+ *                      insecure streams that use the relay from the start.
  *
  * 'error' is emitted with `error.fatal === true` when the player enters ERROR. The only non-fatal 'error' is
  * OFFLINE: the state becomes RECONNECTING (reason 'offline') and playback resumes on the 'online' event.
@@ -471,8 +647,10 @@ export class Player extends EventTarget {
   #engine = null;
   /** Incremented on every teardown; async work captures it and bails out when it changed. */
   #token = 0;
-  /** Current source (one load() call): { url, name, drm, playUrl, upgraded, type, sniffed, chain, index,
-   *  failures, everPlayed, wantPlay, engineType }. */
+  /** Current source (one load() call): { url, name, drm, playUrl, upgraded, proxy, viaProxy, localNetwork, type,
+   *  sniffed, chain, index, failures, everPlayed, wantPlay, engineType }. `proxy` is the relay setting
+   *  captured at load ('' for local-network streams, which it can't reach); `viaProxy` is true once engines
+   *  request through it. */
   #session = null;
   /** Current engine run (one engine instance on one URL). */
   #run = null;
@@ -534,7 +712,8 @@ export class Player extends EventTarget {
 
   // ------------------------------------------------------------------------------------------- public API
 
-  /** Merge new options. `lowLatency` applies to the running hls.js instance; others from the next load. */
+  /** Merge new options. `lowLatency` applies to the running hls.js instance; others (`streamProxy` too) from
+   * the next load. */
   setOptions(partial = {}) {
     if (!partial || typeof partial !== 'object') return;
     this.#opts = normalizeOptions({ ...this.#opts, ...partial });
@@ -696,9 +875,14 @@ export class Player extends EventTarget {
     return this.#session ? { url: this.#session.url, name: this.#session.name } : null;
   }
 
-  /** URL actually being played (may be the https-upgraded variant). */
+  /** URL actually being played (may be the https-upgraded variant). Never the relay URL. */
   get url() {
     return this.#run?.url || this.#session?.playUrl || '';
+  }
+
+  /** True when the current source is played through the stream relay (`streamProxy`). */
+  get viaProxy() {
+    return !!this.#session?.viaProxy;
   }
 
   get isLive() {
@@ -873,6 +1057,7 @@ export class Player extends EventTarget {
       state: this.#state,
       attempt: this.#attempt,
       stalls: run?.stalls || 0,
+      viaProxy: this.viaProxy,
     };
   }
 
@@ -898,12 +1083,18 @@ export class Player extends EventTarget {
   async #begin({ url, name, drm }) {
     try {
       const raw = String(url ?? '').trim();
+      // A relay on the internet can't reach this computer or the local network (and refuses to try): such
+      // streams load as if there were no relay.
+      const localNetwork = isPrivateNetworkUrl(raw);
       const session = {
         url: raw,
         name: String(name || ''),
         drm: !!drm,
         playUrl: raw,
         upgraded: false,
+        proxy: localNetwork ? '' : this.#opts.streamProxy,
+        viaProxy: false,
+        localNetwork,
         type: 'unknown',
         sniffed: undefined,
         engineType: null,
@@ -931,9 +1122,17 @@ export class Player extends EventTarget {
 
       const pageProtocol = this.#opts.pageProtocol ?? globalThis.location?.protocol;
       if (isMixedContent(raw, pageProtocol)) {
-        if (!this.#opts.upgradeInsecure) return this.#fail(mixedContentFailure(false));
-        session.playUrl = upgradeToHttps(raw);
-        session.upgraded = true;
+        const upgrade = this.#opts.upgradeInsecure;
+        if (session.proxy && (!upgrade || hasIpHost(raw))) {
+          // The relay serves the original http:// stream over https.
+          session.viaProxy = true;
+        } else {
+          if (!upgrade) return this.#fail(mixedContentFailure(false, '', localNetwork));
+          // Many hosts serve https too — directly, without loading the relay. With a relay, a failure before
+          // the first frame switches to it with the original URL (see #canSwitchToProxy).
+          session.playUrl = upgradeToHttps(raw);
+          session.upgraded = true;
+        }
       }
       await this.#startCycle();
     } catch (err) {
@@ -971,7 +1170,7 @@ export class Player extends EventTarget {
         if (this.#opts.sniff) {
           const controller = new AbortController();
           this.#sniffAbort = controller;
-          sniffed = await sniffStreamType(session.playUrl, {
+          sniffed = await sniffStreamType(this.#requestUrl(session.playUrl), {
             signal: controller.signal,
             timeoutMs: this.#opts.sniffTimeoutMs,
           });
@@ -1153,10 +1352,29 @@ export class Player extends EventTarget {
     return !!run && run === this.#run && run.token === this.#token && !run.closed && !run.failed;
   }
 
+  /** The load tries an insecure stream's https version and can still fall back to the relay: fail fast. */
+  #upgradeProbe() {
+    const session = this.#session;
+    return !!session && session.upgraded && !!session.proxy && !session.viaProxy && !session.everPlayed;
+  }
+
+  /** The URL to request for `url`: through the relay once the session plays via the proxy. */
+  #requestUrl(url) {
+    const session = this.#session;
+    return session?.viaProxy ? proxify(session.proxy, url) : url;
+  }
+
   // ------------------------------------------------------------------------------------------ engines
 
   #startHls(run) {
-    const hls = new Hls(hlsConfig({ lowLatency: this.#opts.lowLatency, startPosition: this.#resumeAt }));
+    const config = hlsConfig({
+      lowLatency: this.#opts.lowLatency,
+      startPosition: this.#resumeAt,
+      probe: this.#upgradeProbe(),
+    });
+    const session = this.#session;
+    if (session?.viaProxy) config.loader = makeProxyLoader(Hls, session.proxy);
+    const hls = new Hls(config);
     run.hls = hls;
     run.impl = { destroy: () => hls.destroy() };
     const Ev = Hls.Events;
@@ -1249,9 +1467,13 @@ export class Player extends EventTarget {
     const timeout = /timeout/i.test(details);
     const loadError = /LoadError$/.test(details); // manifest/level/frag/key/audioTrack load errors
     const technical = `hls.js: ${details}${Number.isFinite(status) ? ` (status ${status})` : ''}`;
+    // On an insecure stream's https version, this says that version doesn't work: rather than trying the
+    // other engines on it, go straight to the relay (see #canSwitchToProxy).
+    const probe = this.#upgradeProbe();
+    const fail = (f) => this.#handleFailure(run, probe ? { ...f, nextEngine: false } : f);
 
     if (details === D.MANIFEST_PARSING_ERROR || details === D.LEVEL_PARSING_ERROR) {
-      this.#handleFailure(run, failure(E.MANIFEST, MSG.manifest, {
+      fail(failure(E.MANIFEST, MSG.manifest, {
         detail: MSG.manifestDetail, technical, retryable: true, maxRetries: LIMITED_RETRIES, nextEngine: true,
       }));
       return;
@@ -1259,13 +1481,13 @@ export class Player extends EventTarget {
     if (status >= 400) {
       // 401/403 may be an Origin/Referer check that the native player (no CORS request) passes.
       const nextEngine = status === 401 || status === 403;
-      this.#handleFailure(run, httpFailure(status, { technical, nextEngine }));
+      fail(httpFailure(status, { technical, nextEngine }));
       return;
     }
     if (loadError && !(status > 0) && !run.firstFrame && !this.#session?.everPlayed) {
       // Status 0 before playback: CORS rejection or unreachable host. Native playback doesn't need CORS.
       // (A stream that already played passed CORS: then the server is just unreachable — keep reconnecting.)
-      this.#handleFailure(run, corsFailure(technical));
+      fail(corsFailure(technical));
       return;
     }
     if (run.manifestParsed && !run.netRecoverAt) {
@@ -1277,7 +1499,7 @@ export class Player extends EventTarget {
         /* fall through to a full reload */
       }
     }
-    this.#handleFailure(run, timeout ? this.#timeoutFailure(MSG.serverTimeout, technical)
+    fail(timeout ? this.#timeoutFailure(MSG.serverTimeout, technical)
       : networkFailure(MSG.network, 'network', technical));
   }
 
@@ -1315,8 +1537,16 @@ export class Player extends EventTarget {
 
   #startNative(run) {
     const v = this.#video;
-    run.src = run.url;
-    v.src = run.url;
+    run.src = this.#requestUrl(run.url); // the relay rewrites HLS playlists, so native HLS works through it
+    // Through the relay, make the media requests CORS requests: those carry the page's Origin, which the relay
+    // checks (and answers with CORS headers). A plain media request only has a Referer, which browsers drop
+    // for an http:// relay on an https:// page (a relay on http://localhost) or under strict privacy
+    // settings; the relay then refuses it. Direct streams stay no-cors (most IPTV servers send no CORS).
+    attempt(() => {
+      if (this.#session?.viaProxy) v.crossOrigin = 'anonymous';
+      else v.removeAttribute('crossorigin');
+    });
+    v.src = run.src;
     this.#bindNativeAudioTracks(run);
     this.#onMetadata();
     if (this.#session?.wantPlay) this.#autoplay(run);
@@ -1364,7 +1594,8 @@ export class Player extends EventTarget {
         reason: 'no-engine' }));
       return;
     }
-    const player = mpegts.createPlayer({ type, isLive: true, url: run.url }, { ...MPEGTS_CONFIG });
+    const source = { type, isLive: true, url: this.#requestUrl(run.url) };
+    const player = mpegts.createPlayer(source, { ...MPEGTS_CONFIG });
     run.mpegts = player;
     run.impl = {
       destroy() {
@@ -1610,9 +1841,10 @@ export class Player extends EventTarget {
     const t = v.currentTime;
 
     if (state === S.LOADING && !run.firstFrame) {
-      if (now - run.loadingSince >= Math.max(this.#opts.loadTimeoutMs, this.#opts.stallTimeoutMs)) {
-        this.#handleFailure(run, this.#timeoutFailure(MSG.timeout));
-      }
+      const limit = this.#upgradeProbe()
+        ? Math.min(UPGRADE_PROBE_LOAD_MS, this.#opts.loadTimeoutMs)
+        : Math.max(this.#opts.loadTimeoutMs, this.#opts.stallTimeoutMs);
+      if (now - run.loadingSince >= limit) this.#handleFailure(run, this.#timeoutFailure(MSG.timeout));
       return;
     }
 
@@ -1689,12 +1921,19 @@ export class Player extends EventTarget {
     return f;
   }
 
-  #onCycleFailed(cause) {
+  #onCycleFailed(failed) {
     const session = this.#session;
     if (!session) return;
     this.#captureResume();
+    if (this.#canSwitchToProxy(failed)) {
+      this.#switchToProxy(failed);
+      return;
+    }
+    const cause = session.viaProxy && !session.everPlayed && isReachabilityFailure(failed)
+      ? proxyFailure(failed)
+      : failed;
     if (session.upgraded && !session.everPlayed && (NETWORKISH.has(cause.code) || cause.ambiguous)) {
-      this.#fail(mixedContentFailure(true, cause.technical || cause.message));
+      this.#fail(mixedContentFailure(true, cause.technical || cause.message, session.localNetwork));
       return;
     }
     if (!cause.retryable || !this.#opts.autoReconnect) {
@@ -1702,6 +1941,30 @@ export class Player extends EventTarget {
       return;
     }
     this.#scheduleReconnect(cause);
+  }
+
+  /** A load that never played and failed in a way the relay may fix gets one more go through the relay — once
+   * per load: an insecure stream's https version that couldn't be loaded (the failures that otherwise end in
+   * MIXED_CONTENT, see #onCycleFailed), any other stream on a reachability failure (isReachabilityFailure). */
+  #canSwitchToProxy(cause) {
+    const session = this.#session;
+    if (!session || session.viaProxy || !session.proxy || session.everPlayed) return false;
+    if (session.upgraded) return NETWORKISH.has(cause.code) || cause.ambiguous;
+    return isReachabilityFailure(cause);
+  }
+
+  /** Restart the load through the relay right away, like trying another engine: no reconnect attempt is
+   * used and there is no backoff. The relay gets the original (not https-upgraded) URL, and sniffing is redone
+   * through it (the direct probe may have failed). */
+  #switchToProxy(cause) {
+    const session = this.#session;
+    session.viaProxy = true;
+    session.playUrl = session.url;
+    session.upgraded = false;
+    session.sniffed = undefined;
+    session.failures = [];
+    this.#emit('proxy', { reason: cause.reason });
+    this.#startCycle();
   }
 
   #scheduleReconnect(cause) {
@@ -1739,9 +2002,20 @@ export class Player extends EventTarget {
     this.#setEngine(null);
     this.#recovering = false;
     this.#offlineWait = false;
-    this.#error = toPublicError(cause, true);
+    this.#error = toPublicError(this.#withProxyHints(cause), true);
     this.#setState(S.ERROR);
     this.#emit('error', { error: this.#error });
+  }
+
+  /** Flag errors the relay matters for: `viaProxy` when fetching through it failed (the UI points to the
+   * proxy settings); for blocked streams (mixed content, CORS) `localNetwork` when no relay can reach them,
+   * else `canUseProxy` when no relay is configured. */
+  #withProxyHints(f) {
+    const session = this.#session;
+    if (session?.viaProxy) return RELAY_SUSPECTS.has(f.code) || f.ambiguous ? { ...f, viaProxy: true } : f;
+    if (f.code !== E.MIXED_CONTENT && f.code !== E.CORS) return f;
+    if (session?.localNetwork) return { ...f, localNetwork: true };
+    return session?.proxy ? f : { ...f, canUseProxy: true };
   }
 
   /** Remember the VOD position so a reconnect can resume where playback stopped. */
@@ -1844,5 +2118,6 @@ function normalizeOptions(o) {
     loadTimeoutMs: num(o.loadTimeoutMs, DEFAULT_PLAYER_OPTIONS.loadTimeoutMs, 1000, 600000),
     healthyResetMs: num(o.healthyResetMs, DEFAULT_PLAYER_OPTIONS.healthyResetMs, 0, 600000),
     sniffTimeoutMs: num(o.sniffTimeoutMs, DEFAULT_PLAYER_OPTIONS.sniffTimeoutMs, 500, 60000),
+    streamProxy: normalizeProxy(o.streamProxy),
   };
 }

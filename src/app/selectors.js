@@ -2,8 +2,10 @@
 // repeatedly with an unchanged state is free.
 
 import { CATEGORY, UNCATEGORIZED } from './constants.js';
+import { streamRelay } from './relay.js';
 import { naturalCompare } from '../lib/utils.js';
 import { searchChannels } from '../lib/fuzzy.js';
+import { staticPlayability } from '../lib/playability.js';
 
 /** Memoize a function on the identity (Object.is) of its arguments (last call only). */
 function memo(fn) {
@@ -113,22 +115,127 @@ export function selectCategoryChannels(state) {
   return sortedChannels(list, state.sort);
 }
 
-const visible = memo((list, query) => {
+// ---- Playability ------------------------------------------------------------------------------------------
+
+const NO_HEALTH = Object.freeze({});
+const MAX_STATIC_CACHES = 4;
+/**
+ * `${pageProtocol}\n${relay}` -> WeakMap<channel, Playability | null>. Static results only depend on the
+ * channel and these two values, so they survive health changes and are computed once per channel object.
+ * Only a few combinations are kept (the relay changes rarely; the page protocol never does).
+ */
+const staticCaches = new Map();
+/** health entry -> its frozen 'failed' result (stable identity while the entry is unchanged). */
+const failedResults = new WeakMap();
+
+function staticCacheFor(pageProtocol, relay) {
+  const key = `${pageProtocol}\n${relay}`;
+  let cache = staticCaches.get(key);
+  if (!cache) {
+    if (staticCaches.size >= MAX_STATIC_CACHES) staticCaches.delete(staticCaches.keys().next().value);
+    cache = new WeakMap();
+    staticCaches.set(key, cache);
+  }
+  return cache;
+}
+
+function failedPlayability(entry) {
+  let result = failedResults.get(entry);
+  if (!result) {
+    result = Object.freeze({ kind: 'failed', label: 'Unavailable', title: entry.title, at: entry.at });
+    failedResults.set(entry, result);
+  }
+  return result;
+}
+
+const playability = memo((health, relay, pageProtocol) => {
+  const statics = staticCacheFor(pageProtocol, relay);
+  const options = { pageProtocol, streamRelay: relay };
+  return (channel) => {
+    if (!channel || typeof channel !== 'object') return null;
+    let result = statics.get(channel);
+    if (result === undefined) {
+      result = staticPlayability(channel, options);
+      statics.set(channel, result);
+    }
+    if (result) return result;
+    const entry = typeof channel.id === 'string' && Object.hasOwn(health, channel.id) ? health[channel.id] : null;
+    return entry && typeof entry === 'object' ? failedPlayability(entry) : null;
+  };
+});
+/**
+ * Why a channel can't play here: the static checks of staticPlayability() (unsupported format, DRM, insecure
+ * stream without a relay — these win) or a recent failure remembered in `state.health`. Memoized on
+ * (state.health, stream relay, page protocol); static results are cached per channel object, so calling the
+ * returned function for every rendered row (or a whole category) is cheap.
+ * @returns {(channel: object) => (import('../lib/playability.js').Playability | null)} returns frozen,
+ *   shared results (stable identity) — never mutate them.
+ */
+export const selectPlayability = (state) =>
+  playability(state.health || NO_HEALTH, streamRelay(state.settings || {}), globalThis.location?.protocol);
+
+// ---- Visible list ------------------------------------------------------------------------------------------
+
+/** True when both arrays hold the same items in the same order. */
+function sameItems(a, b) {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// Hiding unplayable channels runs in two steps so that switching channels doesn't refilter a 20k list: the
+// filter depends on the list and the playability only; the current channel (never hidden) is put back in a
+// second step that is free unless the current channel itself is unplayable.
+const playableChannels = memo((list, playabilityOf) => {
+  const removed = new Set();
+  const channels = [];
+  for (const channel of list) {
+    if (playabilityOf(channel)) removed.add(channel.id);
+    else channels.push(channel);
+  }
+  return { channels: removed.size ? channels : list, removed };
+});
+
+// While the outcome is unchanged (e.g. a channel outside this category failed, or the current one did and
+// stays on screen) the previous array is returned, so the fuzzy search and the list render aren't redone.
+let lastPlayable = null;
+const withCurrentChannel = memo((list, playable, currentId) => {
+  let channels = playable.channels;
+  if (currentId !== null && playable.removed.has(currentId)) {
+    channels = list.filter((channel) => channel.id === currentId || !playable.removed.has(channel.id));
+  }
+  if (channels !== list && lastPlayable && sameItems(lastPlayable, channels)) channels = lastPlayable;
+  lastPlayable = channels;
+  return channels;
+});
+
+const visible = memo((list, query, total, hidden) => {
   const q = query.trim();
-  if (!q) return { items: list.map((channel) => ({ channel, indices: null })), total: list.length, query: '' };
+  if (!q) return { items: list.map((channel) => ({ channel, indices: null })), total, hidden, query: '' };
   const results = searchChannels(list, q) || [];
   return {
     items: results.map((r) => ({ channel: r.channel, indices: r.indices })),
-    total: list.length,
+    total,
+    hidden,
     query: q,
   };
 });
 /**
- * The list the channel panel renders: category channels filtered/ranked by the fuzzy query.
- * @returns {{ items: Array<{ channel: object, indices: number[] | null }>, total: number, query: string }}
- *   `total` is the category size before searching; `indices` are matched positions in channel.name.
+ * The list the channel panel renders: category channels filtered/ranked by the fuzzy query. With
+ * `settings.hideUnplayable`, channels with a non-null selectPlayability() result are left out before
+ * searching — except the current channel, which always stays.
+ * @returns {{ items: Array<{ channel: object, indices: number[] | null }>, total: number, hidden: number,
+ *   query: string }} `total` is the category size before hiding and searching; `hidden` is how many of those
+ *   were hidden as unplayable; `indices` are matched positions in channel.name.
  */
-export const selectVisibleChannels = (state) => visible(selectCategoryChannels(state), state.query);
+export function selectVisibleChannels(state) {
+  const list = selectCategoryChannels(state);
+  if (!state.settings?.hideUnplayable) return visible(list, state.query, list.length, 0);
+  const playable = playableChannels(list, selectPlayability(state));
+  const channels = withCurrentChannel(list, playable, state.currentChannel?.id ?? null);
+  return visible(channels, state.query, list.length, list.length - channels.length);
+}
 
 /** Human label for the current category. */
 export function selectCategoryLabel(state) {

@@ -1,7 +1,7 @@
 /* ==========================================================================
    Dialogs & theme
    md-   modal shell (ui/modal.js)
-   dlg-  app dialogs: add playlist, playlist manager, settings, shortcuts (ui/dialogs.js)
+   dlg-  app dialogs: add playlist, playlist manager, settings, proxy guide, shortcuts (ui/dialogs.js)
    th-   theme picker / switcher (ui/theme.js)
    ========================================================================== */
 
@@ -27,6 +27,8 @@
   margin: auto;
   padding: 0;
   overflow: hidden;
+  /* Not even scrollable by script/focus: only .md-body scrolls (a scrolled dialog box loses its header). */
+  overflow: clip;
   color: var(--text);
   font-family: var(--font-sans);
   font-size: var(--fs-md);
@@ -730,6 +732,7 @@
   overflow-wrap: anywhere;
 }
 .dlg-row .switch {
+  position: relative; /* anchors the visually hidden checkbox, so focusing it scrolls .md-body only */
   flex: none;
 }
 /* Nested under "Auto-reconnect" */
@@ -797,6 +800,310 @@
   }
   .dlg-row-data .btn {
     align-self: flex-start;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Proxy (stream relay): Settings row, test result, setup guide
+   -------------------------------------------------------------------------- */
+/* Input + button on one line ("Test", "Save & test"). */
+.dlg-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.dlg-inline > .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.dlg-inline > .btn {
+  flex: none;
+}
+.dlg-row-stack > .dlg-inline {
+  margin-top: var(--sp-1);
+}
+.dlg-proxy-test {
+  min-width: 68px;
+}
+.dlg-proxy-test[aria-busy='true'] {
+  cursor: progress;
+}
+/* Ghost link-style button whose label lines up with the field above it. */
+.dlg-row-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-left: calc(-1 * var(--sp-3) + 2px);
+}
+.dlg-link-btn {
+  color: var(--accent-text);
+}
+.dlg-link-btn:hover:not(:disabled) {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+/* The proxy switch only matters once a proxy is set. */
+.dlg-row-switch.is-disabled {
+  cursor: not-allowed;
+}
+.dlg-row-switch.is-disabled:hover {
+  background: none;
+}
+.dlg-row.is-disabled .switch {
+  opacity: 0.5;
+}
+
+/* Test result: icon + one or two lines; collapses when empty. */
+.dlg-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.dlg-check:empty {
+  display: none;
+}
+.dlg-check > .icon,
+.dlg-check > .spinner {
+  flex: none;
+  margin-top: 2px;
+}
+.dlg-check > .spinner {
+  width: 13px;
+  height: 13px;
+  border-width: 2px;
+}
+.dlg-check[data-status='ok'],
+.dlg-check[data-status='warning'] {
+  color: var(--text);
+}
+.dlg-check[data-status='ok'] > .icon {
+  color: var(--success);
+}
+.dlg-check[data-status='warning'] > .icon {
+  color: var(--warning);
+}
+.dlg-check[data-status='error'] {
+  color: var(--danger);
+}
+
+/* Guide */
+.dlg-guide {
+  display: grid;
+  gap: var(--sp-6);
+  padding-top: var(--sp-1);
+}
+.dlg-guide-why {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface-2) 45%, transparent);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+.dlg-guide-why strong {
+  font-weight: var(--fw-semibold);
+  color: var(--text);
+}
+.dlg-guide-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-4);
+  margin-top: var(--sp-1);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+.dlg-guide-facts > li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--text);
+}
+.dlg-guide-facts .icon {
+  color: var(--accent-text);
+}
+.dlg-guide-section {
+  display: grid;
+  gap: var(--sp-3);
+}
+.dlg-guide-section > .dlg-subtitle {
+  margin: 0 0 0 2px;
+}
+.dlg-guide-tabs {
+  margin: 0;
+}
+.dlg-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: var(--radius-xs);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 9.5px;
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.dlg-guide-panel {
+  display: grid;
+  gap: var(--sp-4);
+  padding-top: var(--sp-1);
+}
+
+.dlg-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: 9px var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  color: var(--text);
+}
+.dlg-callout > .icon {
+  margin-top: 1px;
+}
+.dlg-callout[data-tone='success'] {
+  background: var(--success-soft);
+}
+.dlg-callout[data-tone='success'] > .icon {
+  color: var(--success);
+}
+.dlg-callout[data-tone='warning'] {
+  background: var(--warning-soft);
+}
+.dlg-callout[data-tone='warning'] > .icon {
+  color: var(--warning);
+}
+
+/* Numbered steps on a thin rail */
+.dlg-steps {
+  display: grid;
+  counter-reset: dlg-step;
+}
+.dlg-step {
+  position: relative;
+  display: grid;
+  justify-items: start;
+  gap: var(--sp-2);
+  padding: 0 0 var(--sp-4) 38px;
+  counter-increment: dlg-step;
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.dlg-step::before {
+  content: counter(dlg-step);
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+}
+.dlg-step::after {
+  content: '';
+  position: absolute;
+  top: 27px;
+  bottom: 3px;
+  left: 11.5px;
+  width: 1px;
+  background: var(--border-strong);
+}
+.dlg-step:last-child {
+  padding-bottom: 0;
+}
+.dlg-step:last-child::after {
+  display: none;
+}
+.dlg-step-text {
+  padding-top: 1px;
+  overflow-wrap: anywhere;
+}
+.dlg-step-text strong {
+  font-weight: var(--fw-semibold);
+  color: var(--text);
+}
+.dlg-copy-btn.is-done,
+.dlg-copy-btn.is-done:hover:not(:disabled) {
+  color: var(--success);
+}
+
+.dlg-code {
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  white-space: nowrap;
+}
+.dlg-link {
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+}
+/* Icons are display: block by default (base.css); keep this one in the line of text. */
+.dlg-link > .icon {
+  display: inline-block;
+  margin-left: 3px;
+  vertical-align: -1px;
+}
+.dlg-guide-own {
+  margin-top: var(--sp-1);
+}
+.dlg-guide-own > span {
+  color: var(--text-muted);
+}
+.dlg-guide-own strong {
+  font-weight: var(--fw-semibold);
+  color: var(--text);
+}
+.dlg-guide-own .dlg-code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.dlg-guide-connect {
+  display: grid;
+  gap: var(--sp-2);
+}
+.dlg-save-test {
+  min-width: 108px;
+}
+
+/* Narrow sheets: the "Recommended" badge goes under the tab label instead of beside it. */
+@media (max-width: 479.98px) {
+  .dlg-guide-tabs > button {
+    flex-direction: column;
+    gap: 2px;
+    height: auto;
+    min-height: 44px;
+    padding: 5px var(--sp-2);
+    line-height: 1.2;
+  }
+  .dlg-tab-badge {
+    height: 15px;
+    padding: 0 4px;
+    font-size: 9px;
   }
 }
 

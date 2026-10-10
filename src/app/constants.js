@@ -13,7 +13,53 @@ export const KEYS = Object.freeze({
   favorites: `${STORAGE_PREFIX}favorites`,
   recents: `${STORAGE_PREFIX}recents`,
   session: `${STORAGE_PREFIX}session`,
+  health: `${STORAGE_PREFIX}health`, // recently failed channels: { [channelId]: { code, title, at } }
 });
+
+/** Built-in relay values that switch it off (compared case-insensitively). */
+const RELAY_OFF_VALUES = new Set(['off', 'false', 'none', '0']);
+/** The only hosts an http:// built-in relay may use (browsers let https pages reach them; local testing). */
+const LOOPBACK_RELAY_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
+ * A built-in relay setting as the relay to use, else '': empty and "off" / "false" / "none" / "0" (any case)
+ * mean no built-in relay; anything but an https:// URL — or an http:// one on localhost, 127.0.0.1 or [::1] —
+ * is refused (an http:// relay elsewhere is blocked on the https site), and reported to `warn`. A usable
+ * value is returned as written (trimmed): its exact form matters to buildProxyUrl().
+ * @param {unknown} value
+ * @param {(message: string) => void} [warn]
+ * @returns {string}
+ */
+export function normalizeBuiltinRelay(value, warn) {
+  const raw = String(value ?? '').trim();
+  if (!raw || RELAY_OFF_VALUES.has(raw.toLowerCase())) return '';
+  let url = null;
+  try {
+    url = new URL(raw);
+  } catch {
+    /* not an absolute URL */
+  }
+  const secure = url?.protocol === 'https:' || (url?.protocol === 'http:' && LOOPBACK_RELAY_HOSTS.has(url.hostname));
+  if (secure && !url.username && !url.password) return raw;
+  warn?.(
+    `Ignoring the built-in relay ${JSON.stringify(raw)}: use an https:// URL (http://localhost for testing), ` +
+      'or "off" to disable it.',
+  );
+  return '';
+}
+
+/**
+ * This site's built-in stream relay (see proxy/ and README "Play HTTP / blocked streams"). Used when the user
+ * hasn't configured a relay of their own, so insecure http:// and CORS-blocked channels play by default.
+ * Forks can override it at build time with the VITE_BUILTIN_RELAY environment variable (a relay URL, or
+ * "off" to disable it); an empty/unset variable keeps DEFAULT_BUILTIN_RELAY. Both are checked with
+ * normalizeBuiltinRelay(): an unusable value means no built-in relay (and a console warning).
+ */
+const DEFAULT_BUILTIN_RELAY = '';
+const ENV_RELAY = String(import.meta.env?.VITE_BUILTIN_RELAY ?? '').trim();
+export const BUILTIN_RELAY_URL = normalizeBuiltinRelay(ENV_RELAY || DEFAULT_BUILTIN_RELAY, (message) =>
+  console.warn(`[${APP_NAME}] ${message}`),
+);
 
 /** Accent palettes. `swatch` is used for the picker preview only; real colors live in tokens.css. */
 export const ACCENTS = Object.freeze([
@@ -39,7 +85,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   showLogos: true, // show channel logos in the list
   lowLatency: true, // hls.js low-latency mode for LL-HLS streams
   preferNativeHls: false, // use the browser's native HLS instead of hls.js when available
-  corsProxy: '', // optional prefix for *playlist* downloads, e.g. "https://my-proxy.example/?url="
+  corsProxy: '', // the user's OWN relay for playlists AND streams (see proxy/); overrides the built-in relay
+  useBuiltinRelay: true, // fall back to BUILTIN_RELAY_URL when no own relay is set
+  proxyStreams: true, // play blocked streams (insecure http://, no CORS) through the relay
+  hideUnplayable: false, // hide channels that can't play here (unsupported formats, DRM, recently failed)
   autoRefreshHours: 24, // re-download URL playlists in the background when older than this (0 = never)
 });
 

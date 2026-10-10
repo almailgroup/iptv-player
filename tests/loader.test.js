@@ -4,6 +4,7 @@ import {
   buildProxyUrl,
   describeLoadError,
   fetchPlaylist,
+  isProxiedUrl,
   normalizePlaylistUrl,
   readPlaylistFile,
 } from '../src/lib/playlist-loader.js';
@@ -175,6 +176,66 @@ describe('buildProxyUrl', () => {
     expect(buildProxyUrl(undefined, target)).toBe('');
     expect(buildProxyUrl('proxy.example/?url=', target)).toBe('');
   });
+
+  it('uses the relay query form for a bare origin', () => {
+    const encoded = encodeURIComponent(target);
+    expect(buildProxyUrl('https://relay.example.deno.dev', target)).toBe(
+      `https://relay.example.deno.dev/?url=${encoded}`,
+    );
+    expect(buildProxyUrl('  http://localhost:8787 ', target)).toBe(`http://localhost:8787/?url=${encoded}`);
+    // Normalized like the relay's own URLs (lower-case host, no default port).
+    expect(buildProxyUrl('https://Relay.Example:443', target)).toBe(`https://relay.example/?url=${encoded}`);
+  });
+
+  it('keeps prefix semantics for a trailing slash or a path', () => {
+    expect(buildProxyUrl('https://cors.example/', target)).toBe(`https://cors.example/${target}`);
+    expect(buildProxyUrl('https://relay.example/raw/', target)).toBe(`https://relay.example/raw/${target}`);
+    expect(buildProxyUrl('https://relay.example/?url', target)).toBe(`https://relay.example/?url${target}`);
+  });
+});
+
+describe('isProxiedUrl', () => {
+  const stream = 'http://1.2.3.4:8080/live/index.m3u8';
+  const encoded = encodeURIComponent(stream);
+
+  it('recognizes URLs built by buildProxyUrl for every proxy form', () => {
+    for (const proxy of [
+      'https://relay.example.deno.dev',
+      'https://relay.example/?url=',
+      'https://relay.example/fetch?u={url}&raw=1',
+      'https://cors-anywhere.example/',
+    ]) {
+      const proxied = buildProxyUrl(proxy, stream);
+      expect(proxied).not.toBe('');
+      expect(isProxiedUrl(proxied, proxy)).toBe(true);
+      expect(isProxiedUrl(stream, proxy)).toBe(false);
+    }
+  });
+
+  it('recognizes URLs the relay rewrote into a playlist (query and path form)', () => {
+    const rewritten = `https://relay.example.deno.dev/?url=${encoded}`;
+    expect(isProxiedUrl(rewritten, 'https://relay.example.deno.dev')).toBe(true);
+    expect(isProxiedUrl(rewritten, 'https://relay.example.deno.dev/?url=')).toBe(true);
+    expect(isProxiedUrl(`https://relay.example/${stream}`, 'https://relay.example/')).toBe(true);
+  });
+
+  it('compares scheme and host case-insensitively and ignores default ports', () => {
+    const rewritten = `https://relay.example/?url=${encoded}`;
+    expect(isProxiedUrl(rewritten, 'HTTPS://Relay.Example/?url=')).toBe(true);
+    expect(isProxiedUrl(rewritten, 'https://relay.example:443/?url=')).toBe(true);
+    expect(isProxiedUrl(`https://relay.example/?URL=${encoded}`, 'https://relay.example/?url=')).toBe(false);
+  });
+
+  it('is false for other hosts, paths and unusable proxies', () => {
+    expect(isProxiedUrl(`https://other.example/?url=${encoded}`, 'https://relay.example')).toBe(false);
+    expect(isProxiedUrl('https://relay.example/hls/x.m3u8', 'https://relay.example')).toBe(false);
+    expect(isProxiedUrl(`https://relay.example.evil/?url=${encoded}`, 'https://relay.example/?url='))
+      .toBe(false);
+    expect(isProxiedUrl(stream, '')).toBe(false);
+    expect(isProxiedUrl(stream, '{url}')).toBe(false);
+    expect(isProxiedUrl('', 'https://relay.example')).toBe(false);
+    expect(isProxiedUrl(undefined, 'https://relay.example')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------
@@ -270,7 +331,7 @@ describe('fetchPlaylist', () => {
     expect(err.cause).toBeInstanceOf(TypeError);
     expect(err.message).toMatch(/other websites|CORS/);
     expect(err.message).toMatch(/upload/);
-    expect(err.message).toMatch(/proxy/i);
+    expect(err.message).toMatch(/relay/i);
   });
 
   it('maps a fetch TypeError to NETWORK (offline) when the browser is offline', async () => {
@@ -316,6 +377,31 @@ describe('fetchPlaylist', () => {
     expect(fetch.mock.calls[1][0]).toBe(`https://p.example/${target}`);
   });
 
+  it('retries through a bare relay origin with the query form', async () => {
+    const target = 'https://example.com/list.m3u';
+    const fetch = stubFetch(async (url) => {
+      if (url === target) throw new TypeError('Failed to fetch');
+      return new Response(M3U);
+    });
+    const corsProxy = 'https://relay.example.deno.dev';
+    const result = await fetchPlaylist(target, { pageProtocol: 'https:', corsProxy });
+    expect(fetch.mock.calls[1][0]).toBe(`https://relay.example.deno.dev/?url=${encodeURIComponent(target)}`);
+    expect(result).toMatchObject({ viaProxy: true, finalUrl: target });
+  });
+
+  it('never wraps a URL that already goes through the proxy', async () => {
+    const proxied = `https://relay.example/?url=${encodeURIComponent('http://1.2.3.4/list.m3u')}`;
+    const fetch = stubFetch(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    const err = await catchLoadError(
+      fetchPlaylist(proxied, { pageProtocol: 'https:', corsProxy: 'https://relay.example' }),
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0][0]).toBe(proxied);
+    expect(err.code).toBe('CORS');
+  });
+
   it('throws NETWORK (via proxy) when the proxy is unreachable too', async () => {
     stubFetch(async () => {
       throw new TypeError('Failed to fetch');
@@ -325,7 +411,7 @@ describe('fetchPlaylist', () => {
     );
     expect(err.code).toBe('NETWORK');
     expect(err.details.viaProxy).toBe(true);
-    expect(err.message).toMatch(/proxy/);
+    expect(err.message).toMatch(/not even through the relay/);
   });
 
   it('marks HTTP errors returned by the proxy', async () => {
@@ -339,7 +425,8 @@ describe('fetchPlaylist', () => {
     expect(err.code).toBe('HTTP');
     expect(err.status).toBe(502);
     expect(err.details.viaProxy).toBe(true);
-    expect(err.message).toMatch(/CORS proxy/);
+    expect(err.message).toMatch(/through the relay/);
+    expect(err.message).not.toMatch(/proxy/i); // user-facing wording says "relay"
   });
 
   it('throws TIMEOUT when the server does not respond in time', async () => {
@@ -566,7 +653,7 @@ describe('fetchPlaylist', () => {
       expect(err.message).toMatch(/insecure/);
       expect(err.message).toMatch(/https:\/\/ link/);
       expect(err.message).toMatch(/upload/);
-      expect(err.message).toMatch(/CORS proxy in Settings/);
+      expect(err.message).toMatch(/set up a relay in Settings/);
     });
 
     it('also throws MIXED_CONTENT when the https version returns an error or a non-playlist', async () => {
@@ -707,9 +794,9 @@ describe('describeLoadError', () => {
 
   it.each([
     ['INVALID_URL', /valid playlist link/],
-    ['MIXED_CONTENT', /insecure.*https:\/\/ link.*upload.*CORS proxy/s],
+    ['MIXED_CONTENT', /insecure.*https:\/\/ link.*upload.*relay in Settings/s],
     ['NETWORK', /Couldn't reach/],
-    ['CORS', /other websites.*upload.*CORS proxy/s],
+    ['CORS', /other websites.*upload.*relay in Settings/s],
     ['HTTP', /HTTP/],
     ['TIMEOUT', /too long/],
     ['EMPTY', /empty/],

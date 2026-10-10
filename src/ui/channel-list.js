@@ -2,7 +2,8 @@
 // library actions and the search field, above a virtualized, keyboard-navigable listbox of channels.
 //
 // Rendering is driven entirely by the store: the list re-renders when `selectVisibleChannels()` changes
-// identity, and repaints visible rows in place when favorites, the current channel or `showLogos` change.
+// identity, and repaints visible rows in place when favorites, the current channel, `showLogos` or channel
+// playability (selectPlayability(): unsupported formats, DRM, insecure streams, recent failures) change.
 
 import { h, clear, replaceChildren, on } from '../lib/dom.js';
 import { clamp, debounce, formatCount, hueFromString, initials, safeImageUrl } from '../lib/utils.js';
@@ -12,6 +13,7 @@ import {
   selectActivePlaylist,
   selectCategoryLabel,
   selectFavoriteIds,
+  selectPlayability,
   selectVisibleChannels,
 } from '../app/selectors.js';
 import { icon, setIcon } from './icons.js';
@@ -56,6 +58,7 @@ const WATCHED_KEYS = [
   'recents',
   'currentChannel',
   'settings',
+  'health',
   'sidebarOpen',
 ];
 
@@ -72,6 +75,29 @@ function rememberFailedLogo(url) {
 const plural = (n, one, many) => `${formatCount(n)} ${n === 1 ? one : many}`;
 const ellipsize = (str, max) => (str.length > max ? `${str.slice(0, max - 1).trimEnd()}…` : str);
 const ignoreRejection = (value) => Promise.resolve(value).catch(() => {});
+
+/** "just now", "5 min ago", "3 h ago" — remembered failures expire after hours, so that's all it needs. */
+function timeAgo(at, now = Date.now()) {
+  if (!Number.isFinite(at)) return '';
+  const minutes = Math.floor((now - at) / 60_000);
+  if (minutes < 1) return 'just now'; // includes small clock skew into the future
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours} h ago` : `${Math.floor(hours / 24)} days ago`;
+}
+
+/** A playability flag's tooltip: its reason, plus when it happened for remembered failures. */
+function flagTitle(flag) {
+  const when = flag.kind === 'failed' ? timeAgo(flag.at) : '';
+  return when ? `${flag.title} · ${when}` : flag.title;
+}
+
+/** The same reason for the row's accessible name (one clause of a comma-separated label). */
+function flagLabel(flag) {
+  const reason = String(flag.title || '').replace(/[.\s]+$/, '');
+  if (flag.kind !== 'failed') return reason || flag.label;
+  return reason ? `unavailable: ${reason}` : 'unavailable';
+}
 
 /**
  * Create the channel list panel.
@@ -91,6 +117,7 @@ export function createChannelList({ store, actions }) {
   let favIds = new Set();
   let currentId = null;
   let showLogos = true;
+  let playabilityOf = () => null; // selectPlayability() — why a channel can't play here (null = it can)
   let playback = 'idle'; // playback state of the current channel (drives its equalizer)
   let activePlaylistId = null;
   let cursor = -1; // keyboard cursor: index into items, -1 = none
@@ -146,18 +173,20 @@ export function createChannelList({ store, actions }) {
     },
     icon('trash'),
   );
+  // Sort order and the "Hide unplayable channels" filter (only the filter in Recently watched).
   const sortBtn = h(
     'button',
     {
       type: 'button',
       class: 'icon-btn cl-sort-btn',
-      'aria-label': 'Sort channels',
+      'aria-label': 'Sort and filter channels',
       'aria-haspopup': 'menu',
       'aria-expanded': 'false',
       onClick: openSortMenu,
     },
     icon('sort'),
   );
+  sortBtn.dataset.icon = 'sort';
 
   const input = h('input', {
     type: 'search',
@@ -301,6 +330,7 @@ export function createChannelList({ store, actions }) {
       index: -1,
       setsize: -1,
       other: null,
+      flag: undefined,
       fav: null,
       current: null,
       playback: '',
@@ -337,9 +367,16 @@ export function createChannelList({ store, actions }) {
     if (channelChanged) r.name.title = channel.name;
 
     const other = isFromOtherPlaylist(channel);
-    if (channelChanged || r.other !== other) {
-      renderMeta(r.meta, channel, other);
+    const flag = playabilityOf(channel); // frozen, shared results: identity changes only with the reason
+    if (channelChanged || r.other !== other || r.flag !== flag) {
+      renderMeta(r.meta, channel, other, flag);
       r.other = other;
+    }
+    if (r.flag !== flag) {
+      r.flag = flag;
+      row.classList.toggle('is-unplayable', !!flag);
+      if (flag) row.dataset.flag = flag.kind;
+      else delete row.dataset.flag;
     }
 
     const logo = showLogos ? safeImageUrl(channel.logo) : '';
@@ -382,6 +419,7 @@ export function createChannelList({ store, actions }) {
       channel.name,
       channel.group,
       channel.chno != null ? `channel ${channel.chno}` : '',
+      flag ? flagLabel(flag) : '',
       other ? 'from another playlist' : '',
       current ? NOW_PLAYING_LABEL[playback] || 'now playing' : '',
       fav ? 'favorite' : '',
@@ -399,8 +437,14 @@ export function createChannelList({ store, actions }) {
     return channel.index === -1 && !!channel.playlistId && channel.playlistId !== activePlaylistId;
   }
 
-  function renderMeta(metaEl, channel, other) {
+  function renderMeta(metaEl, channel, other, flag) {
     clear(metaEl);
+    // The flag leads the line so a long group name can't truncate it away.
+    if (flag) {
+      metaEl.append(
+        h('span', { class: 'cl-flag', dataset: { kind: flag.kind }, text: flag.label, title: flagTitle(flag) }),
+      );
+    }
     const text = [channel.group, channel.chno != null ? `#${channel.chno}` : ''].filter(Boolean).join(' · ');
     if (text) metaEl.append(text);
     if (other) {
@@ -557,6 +601,16 @@ export function createChannelList({ store, actions }) {
 
   listen(list, 'blur', () => list.classList.remove('is-kbd'));
 
+  // A remembered failure's tooltip says how long ago it happened: refresh it as the pointer reaches it.
+  listen(list, 'pointerover', (e) => {
+    const chip = e.target instanceof Element ? e.target.closest('.cl-flag[data-kind="failed"]') : null;
+    const row = chip?.closest('.cl-row');
+    const flag = row ? rowRefs.get(row)?.flag : null;
+    if (!flag) return;
+    const title = flagTitle(flag);
+    if (chip.title !== title) chip.title = title;
+  });
+
   listen(list, 'click', (e) => {
     const target = e.target instanceof Element ? e.target : null;
     const row = target ? target.closest('.cl-row') : null;
@@ -697,27 +751,46 @@ export function createChannelList({ store, actions }) {
     return state.category === CATEGORY.favorites ? 'Date added' : 'Playlist order';
   }
 
+  const isHiding = (state) => !!state.settings?.hideUnplayable;
+  const showUnplayable = () => actions.updateSettings({ hideUnplayable: false });
+
   function openSortMenu() {
     const state = store.get();
-    openMenu({
+    // Recently watched is always ordered by time — only the filter applies there.
+    const sortable = state.category !== CATEGORY.recent;
+    const handle = openMenu({
       anchor: sortBtn,
       placement: 'bottom-end',
-      label: 'Sort channels',
+      label: sortable ? 'Sort and filter channels' : 'Filter channels',
       className: 'cl-sort-menu',
       items: [
-        { type: 'label', label: 'Sort by' },
+        ...(sortable
+          ? [
+              { type: 'label', label: 'Sort by' },
+              {
+                label: sortLabel(state, 'playlist'),
+                checked: state.sort !== 'name',
+                onSelect: () => actions.setSort('playlist'),
+              },
+              {
+                label: sortLabel(state, 'name'),
+                checked: state.sort === 'name',
+                onSelect: () => actions.setSort('name'),
+              },
+              { type: 'separator' },
+            ]
+          : []),
         {
-          label: sortLabel(state, 'playlist'),
-          checked: state.sort !== 'name',
-          onSelect: () => actions.setSort('playlist'),
-        },
-        {
-          label: sortLabel(state, 'name'),
-          checked: state.sort === 'name',
-          onSelect: () => actions.setSort('name'),
+          label: 'Hide unplayable channels',
+          icon: 'filter',
+          checked: isHiding(state),
+          onSelect: () => actions.updateSettings({ hideUnplayable: !isHiding(store.get()) }),
         },
       ],
     });
+    // openMenu renders `checked` items as radios; this one is an on/off toggle (the only item outside the
+    // "Sort by" group).
+    handle?.el.querySelector('.menu > .menu-item')?.setAttribute('role', 'menuitemcheckbox');
   }
 
   // ---- Body states (list / skeleton / empty states) ------------------------------------------------
@@ -732,6 +805,7 @@ export function createChannelList({ store, actions }) {
       if (state.playlistError && state.playlistError.playlistId === state.activePlaylistId) return 'error';
     }
     if (v.query) return 'no-results';
+    if (v.hidden > 0) return 'all-hidden';
     if (state.category === CATEGORY.favorites) return 'no-favorites';
     if (state.category === CATEGORY.recent) return 'no-recents';
     return 'empty';
@@ -799,19 +873,37 @@ export function createChannelList({ store, actions }) {
       }
       case 'no-results': {
         const inSubCategory = state.category !== CATEGORY.all;
+        const hidden = v.hidden > 0;
+        const text = inSubCategory
+          ? `Nothing in ${selectCategoryLabel(state)} matches. Try all channels or different words.`
+          : 'Check the spelling or try fewer words.';
+        // No-break space: the count shouldn't end a line on its own.
+        const hiddenNote = `${formatCount(v.hidden)}\u00a0${
+          v.hidden === 1 ? 'unplayable channel is' : 'unplayable channels are'
+        } hidden.`;
         return emptyState(
           'search',
           `No matches for “${ellipsize(v.query, 48)}”`,
-          inSubCategory
-            ? `Nothing in ${selectCategoryLabel(state)} matches. Try all channels or different words.`
-            : 'Check the spelling or try fewer words.',
+          hidden ? `${text} ${hiddenNote}` : text,
           [
             inSubCategory ? button('Search all channels', 'primary', searchAllChannels) : null,
             button('Clear search', 'secondary', () => {
               clearSearch();
               input.focus({ preventScroll: true });
             }),
+            hidden ? button('Show hidden', 'ghost', showUnplayable) : null,
           ].filter(Boolean),
+        );
+      }
+      case 'all-hidden': {
+        const where = state.category === CATEGORY.all ? 'this playlist' : selectCategoryLabel(state);
+        return emptyState(
+          'filter',
+          'No playable channels',
+          v.hidden === 1
+            ? `The only channel in ${where} can’t play here, so it’s hidden.`
+            : `All ${formatCount(v.hidden)}\u00a0channels in ${where} can’t play here, so they’re hidden.`,
+          [button(v.hidden === 1 ? 'Show it anyway' : 'Show them anyway', 'secondary', showUnplayable)],
         );
       }
       case 'no-favorites':
@@ -842,7 +934,8 @@ export function createChannelList({ store, actions }) {
     body.setAttribute('aria-busy', String(isLoading));
 
     let key = mode;
-    if (mode === 'no-results') key += `|${v.query}|${state.category}`;
+    if (mode === 'no-results') key += `|${v.query}|${state.category}|${v.hidden}`;
+    else if (mode === 'all-hidden') key += `|${state.category}|${v.hidden}`;
     else if (mode === 'error') key += `|${state.playlistError?.message}|${state.activePlaylistId}`;
     else if (mode === 'empty') key += `|${state.category}`;
     if (key === modeKey) return;
@@ -859,23 +952,44 @@ export function createChannelList({ store, actions }) {
       list.setAttribute('aria-label', label);
     }
 
+    // Counts exclude hidden (unplayable) channels, which get their own "· N hidden".
+    const hidden = v.hidden > 0 ? v.hidden : 0;
+    const shown = v.total - hidden;
     let count;
     if (mode === 'loading') count = state.busy?.message || 'Loading channels…';
     else if (mode === 'no-playlist' || mode === 'no-active' || mode === 'error') count = '';
-    else if (v.query) count = `${formatCount(v.items.length)} of ${formatCount(v.total)}`;
-    else count = plural(v.total, 'channel', 'channels');
+    else {
+      count = v.query
+        ? `${formatCount(v.items.length)} of ${formatCount(shown)}`
+        : plural(shown, 'channel', 'channels');
+      if (hidden) count += ` · ${formatCount(hidden)} hidden`;
+    }
     if (countEl.textContent !== count) countEl.textContent = count;
+    const countTitle = hidden && count ? `${plural(hidden, 'channel', 'channels')} that can’t play here` : '';
+    if (countEl.title !== countTitle) countEl.title = countTitle;
 
     const cat = state.category;
     exportBtn.hidden = cat !== CATEGORY.favorites;
     exportBtn.disabled = !state.favorites.length;
     clearRecentsBtn.hidden = cat !== CATEGORY.recent;
     clearRecentsBtn.disabled = !state.recents.length;
-    // Recently watched is always ordered by time — sorting doesn't apply there.
-    sortBtn.hidden = cat === CATEGORY.recent;
-    const sorted = state.sort === 'name';
-    sortBtn.classList.toggle('is-sorted', sorted);
-    sortBtn.title = `Sort: ${sortLabel(state)}`;
+    // Recently watched is always ordered by time: there the menu only holds the filter.
+    const sortable = cat !== CATEGORY.recent;
+    const sorted = sortable && state.sort === 'name';
+    const hiding = isHiding(state);
+    const menuIcon = sortable ? 'sort' : 'filter';
+    if (sortBtn.dataset.icon !== menuIcon) {
+      sortBtn.dataset.icon = menuIcon;
+      setIcon(sortBtn, menuIcon);
+    }
+    // A quiet accent dot whenever the list isn't in its default order / unfiltered.
+    sortBtn.classList.toggle('is-sorted', sorted || hiding);
+    const menuLabel = sortable ? 'Sort and filter channels' : 'Filter channels';
+    if (sortBtn.getAttribute('aria-label') !== menuLabel) sortBtn.setAttribute('aria-label', menuLabel);
+    const filterNote = hiding ? 'unplayable channels hidden' : '';
+    sortBtn.title = sortable
+      ? [`Sort: ${sortLabel(state)}`, filterNote].filter(Boolean).join(' · ')
+      : `Filter${filterNote ? `: ${filterNote}` : ''}`;
     menuBtn.setAttribute('aria-expanded', String(!!state.sidebarOpen));
 
     const showScope = mode === 'list' && !!v.query && cat !== CATEGORY.all && v.items.length < FEW_RESULTS;
@@ -917,6 +1031,8 @@ export function createChannelList({ store, actions }) {
     const nextFav = selectFavoriteIds(state);
     const nextCurrent = state.currentChannel ? state.currentChannel.id : null;
     const nextLogos = state.settings ? state.settings.showLogos !== false : true;
+    // Memoized on (health, stream relay, page protocol): a new function means some flags may have changed.
+    const nextPlayability = selectPlayability(state);
     const prevVisible = visible;
     const listChanged = v !== prevVisible;
     const currentChanged = nextCurrent !== currentId;
@@ -924,10 +1040,12 @@ export function createChannelList({ store, actions }) {
       currentChanged ||
       nextFav !== favIds ||
       nextLogos !== showLogos ||
+      nextPlayability !== playabilityOf ||
       state.activePlaylistId !== activePlaylistId;
     favIds = nextFav;
     currentId = nextCurrent;
     showLogos = nextLogos;
+    playabilityOf = nextPlayability;
     activePlaylistId = state.activePlaylistId;
 
     // Search field <- store (external changes only, e.g. shortcuts or a playlist switch).

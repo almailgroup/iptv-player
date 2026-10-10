@@ -1291,6 +1291,12 @@
     display: none;
   }
 }
+/* With the relay actions there can be four buttons: drop "Copy stream URL" first when space is short. */
+@container (max-height: 300px) {
+  .pv-error-actions[data-crowded] .pv-err-copy {
+    display: none;
+  }
+}
 @container (max-width: 400px) {
   .pv-err-btn .icon {
     display: none;

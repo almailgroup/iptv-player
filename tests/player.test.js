@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vite
 
 const mocks = vi.hoisted(() => ({
   hls: [],
+  loaders: [],
   hlsSupported: { value: true },
   ts: [],
   tsFeatures: { value: { mseLivePlayback: true } },
@@ -43,6 +44,36 @@ vi.mock('hls.js', () => {
     BUFFER_STALLED_ERROR: 'bufferStalledError',
     INTERNAL_EXCEPTION: 'internalException',
   };
+  /** Stand-in for hls.js' default (XHR) loader: records the request so tests can answer it. */
+  class FakeLoader {
+    constructor(config) {
+      this.hlsConfig = config;
+      this.context = null;
+      this.callbacks = null;
+      this.stats = { aborted: false, loaded: 0, retry: 0, loading: { start: 0, first: 0, end: 0 } };
+      mocks.loaders.push(this);
+    }
+    load(context, config, callbacks) {
+      if (this.stats.loading.start) throw new Error('Loader can only be used once.');
+      this.stats.loading.start = 1;
+      this.context = context;
+      this.config = config;
+      this.callbacks = callbacks;
+    }
+    abort() {
+      this.stats.aborted = true;
+      this.callbacks?.onAbort?.(this.stats, this.context, null);
+    }
+    destroy() {
+      this.callbacks = this.context = this.config = null;
+    }
+    getCacheAge() {
+      return 3;
+    }
+    getResponseHeader(name) {
+      return name === 'Retry-After' ? '5' : null;
+    }
+  }
   class FakeHls {
     static isSupported() {
       return mocks.hlsSupported.value;
@@ -55,6 +86,9 @@ vi.mock('hls.js', () => {
     }
     static get ErrorDetails() {
       return ErrorDetails;
+    }
+    static get DefaultConfig() {
+      return { loader: FakeLoader };
     }
     constructor(config) {
       this.config = config;
@@ -165,7 +199,15 @@ vi.mock('mpegts.js', () => {
   return { default: mpegts };
 });
 
-import { Player, PlayerState, PlayerErrorCode, buildLevelList, loadHls } from '../src/player/player.js';
+import Hls from 'hls.js';
+import {
+  Player,
+  PlayerState,
+  PlayerErrorCode,
+  buildLevelList,
+  loadHls,
+  makeProxyLoader,
+} from '../src/player/player.js';
 
 // ---------------------------------------------------------------------------------------------------------
 // Helpers
@@ -245,7 +287,7 @@ function createVideo({ nativeHls = '' } = {}) {
 function record(player) {
   const events = [];
   for (const type of ['statechange', 'error', 'reconnecting', 'levels', 'levelswitch', 'audiotracks', 'engine',
-    'autoplaymuted', 'live', 'recovered']) {
+    'autoplaymuted', 'live', 'recovered', 'proxy']) {
     player.addEventListener(type, (e) => events.push({ type, detail: e.detail }));
   }
   events.of = (type) => events.filter((e) => e.type === type).map((e) => e.detail);
@@ -289,6 +331,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   mocks.hls.length = 0;
+  mocks.loaders.length = 0;
   mocks.ts.length = 0;
   mocks.hlsSupported.value = true;
   mocks.tsFeatures.value = { mseLivePlayback: true };
@@ -1361,7 +1404,9 @@ describe('Player — controls and lifecycle', () => {
       isLive: true,
       state: 'playing',
       attempt: 0,
+      viaProxy: false,
     });
+    expect(player.viaProxy).toBe(false);
     expect(stats).toHaveProperty('droppedFrames');
     expect(stats).toHaveProperty('totalFrames');
   });
@@ -1385,6 +1430,654 @@ describe('Player — controls and lifecycle', () => {
     player.setOptions({ lowLatency: false, maxRetries: 3 });
     expect(lastHls().lowLatencyMode).toBe(false);
     expect(player.options.maxRetries).toBe(3);
+  });
+});
+
+describe('Player — stream relay (proxy)', () => {
+  const PROXY = 'https://relay.example.deno.dev';
+  const relayed = (url) => `${PROXY}/?url=${encodeURIComponent(url)}`;
+  const INSECURE_HLS = 'http://1.2.3.4:8080/live/index.m3u8';
+  const PROXY_MESSAGE = 'Couldn’t play this stream through the relay.';
+  const PROXY_DETAIL =
+    'Check that the relay is running and its address is correct (Settings → Network), or try again later.';
+
+  /** Instantiate the relay loader hls.js got, plus the default loader it wraps. */
+  function relayLoader(hls = lastHls()) {
+    const loader = new hls.config.loader({ testConfig: true });
+    return { loader, inner: mocks.loaders.at(-1) };
+  }
+
+  it('plays insecure streams through the relay instead of trying https', async () => {
+    for (const upgradeInsecure of [true, false]) {
+      const { events } = setup({ streamProxy: PROXY, upgradeInsecure });
+      await player.load({ url: INSECURE_HLS });
+      const hls = lastHls();
+      expect(hls.url).toBe(INSECURE_HLS); // hls.js works with the stream URL; its loader relays the requests
+      expect(hls.config.loader).toBeTypeOf('function');
+      expect(player.state).toBe('loading');
+      expect(player.url).toBe(INSECURE_HLS);
+      expect(player.viaProxy).toBe(true);
+      expect(player.getStats()).toMatchObject({ url: INSECURE_HLS, viaProxy: true });
+      expect(events.of('proxy')).toHaveLength(0);
+      hls.emit('hlsManifestParsed', {});
+      ctl.startPlaying();
+      expect(player.state).toBe('playing');
+    }
+  });
+
+  it('relays hls.js requests but hands hls.js its own context and the stream URL back', async () => {
+    setup({ streamProxy: PROXY });
+    await player.load({ url: INSECURE_HLS });
+    const { loader, inner } = relayLoader();
+    expect(inner.hlsConfig).toEqual({ testConfig: true });
+
+    const context = { url: INSECURE_HLS, type: 'manifest', responseType: 'text', level: null };
+    const loadConfig = { loadPolicy: {} };
+    const callbacks = { onSuccess: vi.fn(), onError: vi.fn(), onTimeout: vi.fn(), onAbort: vi.fn() };
+    loader.load(context, loadConfig, callbacks);
+    expect(inner.context).toEqual({ ...context, url: relayed(INSECURE_HLS) });
+    expect(context.url).toBe(INSECURE_HLS); // not mutated
+    expect(inner.config).toBe(loadConfig);
+    // hls.js compares loader.context with new requests (in-flight dedupe): it must be its own object.
+    expect(loader.context).toBe(context);
+    expect(loader.stats).toBe(inner.stats);
+    expect(inner.callbacks.onProgress).toBeUndefined(); // absent stays absent
+
+    inner.callbacks.onSuccess({ url: relayed(INSECURE_HLS), data: '#EXTM3U', code: 200 }, inner.stats,
+      inner.context, 'xhr');
+    expect(callbacks.onSuccess).toHaveBeenCalledWith({ url: INSECURE_HLS, data: '#EXTM3U', code: 200 },
+      inner.stats, context, 'xhr');
+    expect(callbacks.onSuccess.mock.calls[0][2]).toBe(context);
+    inner.callbacks.onError({ code: 502, text: 'Bad Gateway' }, inner.context, 'xhr', inner.stats);
+    expect(callbacks.onError).toHaveBeenCalledWith({ code: 502, text: 'Bad Gateway' }, context, 'xhr',
+      inner.stats);
+    inner.callbacks.onTimeout(inner.stats, inner.context, 'xhr');
+    expect(callbacks.onTimeout).toHaveBeenCalledWith(inner.stats, context, 'xhr');
+    loader.abort();
+    expect(callbacks.onAbort).toHaveBeenCalledWith(inner.stats, context, null);
+    expect(loader.getCacheAge()).toBe(3);
+    expect(loader.getResponseHeader('Retry-After')).toBe('5');
+
+    // Like the default loader, a loader is single-use; the failed call changes nothing.
+    expect(() => loader.load({ ...context, url: 'https://other.example/x.m3u8' }, loadConfig, callbacks))
+      .toThrow(/only be used once/);
+    expect(loader.context).toBe(context);
+    loader.destroy();
+    expect(loader.context).toBeNull();
+  });
+
+  it('passes progress through with the original context', async () => {
+    setup({ streamProxy: PROXY });
+    await player.load({ url: INSECURE_HLS });
+    const { loader, inner } = relayLoader();
+    const segment = 'http://1.2.3.4:8080/live/seg1.ts';
+    const context = { url: segment, type: 'media-fragment', responseType: 'arraybuffer' };
+    const onProgress = vi.fn();
+    loader.load(context, {}, { onSuccess() {}, onError() {}, onTimeout() {}, onProgress });
+    const chunk = new ArrayBuffer(8);
+    inner.callbacks.onProgress(inner.stats, inner.context, chunk, 'xhr');
+    expect(onProgress).toHaveBeenCalledWith(inner.stats, context, chunk, 'xhr');
+    expect(inner.callbacks).not.toHaveProperty('onAbort');
+  });
+
+  it('never wraps URLs that already go through the relay, nor non-http URLs', async () => {
+    setup({ streamProxy: PROXY });
+    await player.load({ url: INSECURE_HLS });
+    const callbacks = { onSuccess: vi.fn(), onError() {}, onTimeout() {} };
+    // Segment URLs in a playlist the relay rewrote already point at it.
+    const segment = relayed('http://1.2.3.4:8080/live/seg1.ts');
+    let { loader, inner } = relayLoader();
+    loader.load({ url: segment, type: 'media-fragment', responseType: 'arraybuffer' }, {}, callbacks);
+    expect(inner.context.url).toBe(segment);
+    inner.callbacks.onSuccess({ url: segment, data: new ArrayBuffer(1) }, inner.stats, inner.context, null);
+    expect(callbacks.onSuccess.mock.calls[0][0].url).toBe(segment);
+
+    ({ loader, inner } = relayLoader());
+    const key = 'data:text/plain;base64,AAECAwQFBgcICQoLDA0ODw==';
+    loader.load({ url: key, type: 'key', responseType: 'arraybuffer' }, {}, callbacks);
+    expect(inner.context.url).toBe(key);
+  });
+
+  it('reuses one loader class per relay setting', async () => {
+    setup({ streamProxy: PROXY });
+    await player.load({ url: INSECURE_HLS });
+    await player.load({ url: 'http://5.6.7.8/live.m3u8' });
+    expect(mocks.hls[0].config.loader).toBe(mocks.hls[1].config.loader);
+    expect(makeProxyLoader(Hls, PROXY)).toBe(mocks.hls[0].config.loader);
+    expect(makeProxyLoader(Hls, 'https://other-relay.example')).not.toBe(mocks.hls[0].config.loader);
+    expect(() => makeProxyLoader({}, PROXY)).toThrow(TypeError);
+  });
+
+  it('switches to the relay once on a CORS failure, without using a reconnect attempt', async () => {
+    vi.useFakeTimers();
+    const { events } = setup({ streamProxy: PROXY });
+    await player.load({ url: HLS_URL });
+    const direct = lastHls();
+    expect(direct.config.loader).toBeUndefined();
+    expect(player.viaProxy).toBe(false);
+    direct.emit('hlsError', manifestError(0));
+    await flush();
+    expect(direct.destroyed).toBe(true);
+    expect(events.of('proxy')).toEqual([{ reason: 'cors' }]);
+    expect(events.of('reconnecting')).toHaveLength(0);
+    expect(events.of('error')).toHaveLength(0);
+    expect(player.attempt).toBe(0);
+    expect(player.state).toBe('loading');
+
+    const viaRelay = lastHls();
+    expect(mocks.hls).toHaveLength(2);
+    expect(viaRelay.url).toBe(HLS_URL);
+    expect(viaRelay.config.loader).toBeTypeOf('function');
+    expect(player.viaProxy).toBe(true);
+    expect(player.url).toBe(HLS_URL);
+    viaRelay.emit('hlsManifestParsed', {});
+    ctl.startPlaying();
+    expect(player.state).toBe('playing');
+    expect(player.getStats().viaProxy).toBe(true);
+  });
+
+  it('reports a proxy error when the stream fails through the relay too', async () => {
+    vi.useFakeTimers();
+    const { events } = setup({ streamProxy: PROXY });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    for (let i = 0; i < 3; i++) {
+      lastHls().emit('hlsError', manifestError(0));
+      await flush();
+      if (i < 2) {
+        const info = events.of('reconnecting').at(-1);
+        expect(info).toMatchObject({ attempt: i + 1, max: 2, code: 'NETWORK', reason: PROXY_MESSAGE });
+        await vi.advanceTimersByTimeAsync(info.delayMs);
+        expect(lastHls().config.loader).toBeTypeOf('function'); // reconnects stay on the relay
+      }
+    }
+    expect(events.of('proxy')).toHaveLength(1);
+    expect(player.state).toBe('error');
+    expect(player.error).toMatchObject({ code: 'NETWORK', detail: PROXY_DETAIL, viaProxy: true });
+    expect(player.error.message).toBe(`Couldn’t reconnect after 2 attempts. ${PROXY_MESSAGE}`);
+    expect(player.error).not.toHaveProperty('canUseProxy');
+  });
+
+  it('fails with the proxy error right away when auto-reconnect is off', async () => {
+    const { events } = setup({ streamProxy: PROXY, autoReconnect: false });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    expect(player.state).toBe('loading'); // the switch is not a reconnect
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    expect(player.error).toEqual({
+      code: 'NETWORK',
+      message: PROXY_MESSAGE,
+      detail: PROXY_DETAIL,
+      technical: 'hls.js: manifestLoadError (status 0)',
+      fatal: true,
+      viaProxy: true,
+    });
+    expect(events.of('error')).toHaveLength(1);
+  });
+
+  it('switches on 401/403 refusals and keeps the HTTP status through the relay', async () => {
+    const { events } = setup({ streamProxy: PROXY, autoReconnect: false });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', manifestError(403));
+    await flush();
+    expect(events.of('proxy')).toEqual([{ reason: 'http-403' }]);
+    lastHls().emit('hlsError', manifestError(403));
+    await flush();
+    expect(player.error).toMatchObject({ code: 'HTTP', status: 403, message: PROXY_MESSAGE, viaProxy: true });
+  });
+
+  it('switches when a stream times out before it starts', async () => {
+    vi.useFakeTimers();
+    const { events } = setup({ streamProxy: PROXY });
+    await player.load({ url: HLS_URL });
+    await vi.advanceTimersByTimeAsync(25000);
+    expect(events.of('proxy')).toEqual([{ reason: 'timeout' }]);
+    expect(events.of('reconnecting')).toHaveLength(0);
+    expect(lastHls().config.loader).toBeTypeOf('function');
+  });
+
+  it('keeps errors a relay can’t fix as they are', async () => {
+    vi.useFakeTimers();
+    const { events } = setup({ streamProxy: PROXY });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', manifestError(404));
+    await flush();
+    expect(events.of('reconnecting')[0]).toMatchObject({ code: 'HTTP', max: 2 });
+    await vi.advanceTimersByTimeAsync(events.of('reconnecting')[0].delayMs);
+    expect(lastHls().config.loader).toBeUndefined();
+
+    const codec = setup({ streamProxy: PROXY });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', { type: 'mediaError', details: 'manifestIncompatibleCodecsError', fatal: true });
+    await flush();
+    expect(player.error.code).toBe('UNSUPPORTED');
+    expect(player.error).not.toHaveProperty('viaProxy');
+    expect(player.error).not.toHaveProperty('canUseProxy');
+    expect([...events.of('proxy'), ...codec.events.of('proxy')]).toHaveLength(0);
+  });
+
+  it('does not switch a stream that already played', async () => {
+    vi.useFakeTimers();
+    const { events } = setup({ streamProxy: PROXY });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsManifestParsed', {});
+    ctl.startPlaying();
+    lastHls().emit('hlsError', netError('fragLoadError', 0)); // in-place startLoad() first
+    lastHls().emit('hlsError', netError('fragLoadError', 0));
+    await flush();
+    expect(events.of('reconnecting')[0]).toMatchObject({ attempt: 1, max: 8, code: 'NETWORK' });
+    await vi.advanceTimersByTimeAsync(events.of('reconnecting')[0].delayMs);
+    expect(lastHls().config.loader).toBeUndefined();
+    expect(events.of('proxy')).toHaveLength(0);
+  });
+
+  it('switches at most once per load; a new load starts direct again', async () => {
+    const { events } = setup({ streamProxy: PROXY, autoReconnect: false });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    expect(events.of('proxy')).toHaveLength(1);
+    expect(mocks.hls).toHaveLength(2);
+
+    await player.load({ url: HLS_URL });
+    expect(player.viaProxy).toBe(false);
+    expect(lastHls().config.loader).toBeUndefined();
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    expect(events.of('proxy')).toHaveLength(2);
+    expect(player.viaProxy).toBe(true);
+  });
+
+  it('flags blocked streams when no relay is configured, so the UI can offer one', async () => {
+    const { events } = setup({ upgradeInsecure: false });
+    await player.load({ url: INSECURE_HLS });
+    expect(player.error).toMatchObject({ code: 'MIXED_CONTENT', canUseProxy: true });
+    expect(player.error).not.toHaveProperty('viaProxy');
+
+    setup(); // https upgrade, which fails
+    await player.load({ url: INSECURE_HLS });
+    expect(lastHls().config.loader).toBeUndefined();
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    expect(player.error).toMatchObject({ code: 'MIXED_CONTENT', canUseProxy: true });
+
+    setup({ autoReconnect: false });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    expect(player.error).toMatchObject({ code: 'CORS', canUseProxy: true });
+    expect(player.viaProxy).toBe(false);
+
+    setup({ autoReconnect: false });
+    await player.load({ url: HLS_URL });
+    lastHls().emit('hlsError', manifestError(404));
+    await flush();
+    expect(player.error).not.toHaveProperty('canUseProxy');
+    expect(events.of('proxy')).toHaveLength(0);
+  });
+
+  it('plays native and MPEG-TS streams from relayed URLs', async () => {
+    vi.useFakeTimers();
+    const { events } = setup({ streamProxy: PROXY });
+    const movie = 'http://1.2.3.4:8080/movie.mp4';
+    await player.load({ url: movie });
+    expect(player.engine).toBe('native');
+    expect(ctl.video.getAttribute('src')).toBe(relayed(movie));
+    // CORS mode, so the request carries the Origin the relay checks (no Referer reaches an http:// relay).
+    expect(ctl.video.getAttribute('crossorigin')).toBe('anonymous');
+    expect(player.url).toBe(movie);
+    expect(player.getStats()).toMatchObject({ url: movie, viaProxy: true });
+    ctl.fail(2); // errors of the relayed src are still recognized
+    await flush();
+    expect(events.of('reconnecting')[0]).toMatchObject({ code: 'NETWORK', max: 2, reason: PROXY_MESSAGE });
+    await vi.advanceTimersByTimeAsync(events.of('reconnecting')[0].delayMs);
+    expect(ctl.video.getAttribute('src')).toBe(relayed(movie));
+
+    const ts = 'http://1.2.3.4:8080/live/u/p/42.ts';
+    await player.load({ url: ts });
+    await vi.waitFor(() => expect(mocks.ts).toHaveLength(1));
+    expect(lastTs().dataSource).toEqual({ type: 'mpegts', isLive: true, url: relayed(ts) });
+    expect(player.url).toBe(ts);
+  });
+
+  it('plays native HLS from the relayed URL', async () => {
+    setup({ streamProxy: PROXY, preferNativeHls: true }, { nativeHls: 'probably' });
+    await player.load({ url: INSECURE_HLS });
+    expect(player.engine).toBe('native');
+    expect(ctl.video.getAttribute('src')).toBe(relayed(INSECURE_HLS));
+    expect(ctl.video.getAttribute('crossorigin')).toBe('anonymous');
+  });
+
+  it('requests direct native streams without CORS, also after a relayed one', async () => {
+    setup({ streamProxy: PROXY });
+    await player.load({ url: 'http://1.2.3.4:8080/movie.mp4' });
+    expect(ctl.video.getAttribute('crossorigin')).toBe('anonymous');
+    const direct = 'https://cdn.example.com/movie.mp4'; // most stream servers send no CORS headers
+    await player.load({ url: direct });
+    expect(player.engine).toBe('native');
+    expect(ctl.video.getAttribute('src')).toBe(direct);
+    expect(ctl.video.hasAttribute('crossorigin')).toBe(false);
+  });
+
+  it('marks failures through the relay that the relay may cause', async () => {
+    setup({ streamProxy: PROXY });
+    await player.load({ url: 'http://1.2.3.4:8080/movie.mp4' });
+    ctl.fail(4); // native "src not supported": maybe the relay answered with an error page
+    await flush();
+    expect(player.error).toMatchObject({ code: 'UNSUPPORTED', viaProxy: true });
+  });
+
+  it('sniffs through the relay, and again after switching to it', async () => {
+    const fetch = vi.fn(async (url) => {
+      if (!url.startsWith(PROXY)) throw new TypeError('Failed to fetch');
+      return { ok: true, status: 200, url, headers: { get: () => 'video/mp2t' }, body: null };
+    });
+    vi.stubGlobal('fetch', fetch);
+    const insecure = 'http://1.2.3.4:8080/u/p/1001';
+    setup({ sniff: true, streamProxy: PROXY });
+    await player.load({ url: insecure });
+    expect(fetch.mock.calls[0][0]).toBe(relayed(insecure));
+    await vi.waitFor(() => expect(mocks.ts).toHaveLength(1));
+    expect(lastTs().dataSource).toEqual({ type: 'mpegts', isLive: true, url: relayed(insecure) });
+
+    // An https stream whose direct sniff fails (CORS): every engine fails, then the relay sniffs again.
+    const secure = 'https://xtream.example.com/u/p/1001';
+    const { events } = setup({ sniff: true, streamProxy: PROXY });
+    fetch.mockClear();
+    mocks.ts.length = 0;
+    await player.load({ url: secure });
+    expect(fetch.mock.calls.map((c) => c[0])).toEqual([secure]);
+    expect(player.engine).toBe('native');
+    ctl.fail(4);
+    await flush();
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    await vi.waitFor(() => expect(mocks.ts).toHaveLength(1));
+    lastTs().emit('error', 'NetworkError', 'Exception', { code: -1, msg: 'Failed to fetch' });
+    await flush();
+    expect(events.of('proxy')).toEqual([{ reason: 'cors' }]);
+    await vi.waitFor(() => expect(mocks.ts).toHaveLength(2));
+    expect(fetch.mock.calls.map((c) => c[0])).toEqual([secure, relayed(secure)]);
+    expect(lastTs().dataSource.url).toBe(relayed(secure));
+    expect(player.getStats().type).toBe('mpegts');
+  });
+
+  it('applies streamProxy from setOptions() on the next load (or retry)', async () => {
+    const { events } = setup();
+    await player.load({ url: INSECURE_HLS });
+    expect(lastHls().url).toBe('https://1.2.3.4:8080/live/index.m3u8'); // upgraded
+    player.setOptions({ streamProxy: PROXY });
+    expect(player.options.streamProxy).toBe(PROXY);
+    expect(player.viaProxy).toBe(false);
+    lastHls().emit('hlsError', manifestError(0));
+    await flush();
+    expect(player.error.code).toBe('MIXED_CONTENT'); // the running load keeps its mode
+    expect(events.of('proxy')).toHaveLength(0);
+
+    player.retry();
+    await flush();
+    expect(player.viaProxy).toBe(true);
+    expect(lastHls().url).toBe(INSECURE_HLS);
+
+    player.setOptions({ streamProxy: '' });
+    await player.load({ url: INSECURE_HLS });
+    expect(player.viaProxy).toBe(false);
+    expect(lastHls().config.loader).toBeUndefined();
+  });
+
+  describe('insecure streams on a named host (https first, then the relay)', () => {
+    const NAMED = 'http://tv.example.com/live/index.m3u8';
+    const UPGRADED = 'https://tv.example.com/live/index.m3u8';
+
+    it('tries the https version first, fast, then switches to the relay with the original URL', async () => {
+      const { events } = setup({ streamProxy: PROXY }, { nativeHls: 'maybe' });
+      await player.load({ url: NAMED });
+      const upgraded = lastHls();
+      expect(upgraded.url).toBe(UPGRADED);
+      expect(upgraded.config.loader).toBeUndefined();
+      expect(player.viaProxy).toBe(false);
+      expect(player.url).toBe(UPGRADED);
+      // A dead https variant must not hold the relay up: short time-to-first-byte, no manifest retries.
+      expect(upgraded.config.manifestLoadPolicy.default).toMatchObject({
+        maxTimeToFirstByteMs: 5000,
+        timeoutRetry: { maxNumRetry: 0 },
+        errorRetry: { maxNumRetry: 0 },
+      });
+
+      upgraded.emit('hlsError', manifestError(0));
+      await flush();
+      expect(upgraded.destroyed).toBe(true);
+      // Straight to the relay: native HLS isn't tried on the https URL hls.js couldn't reach.
+      expect(events.of('engine').map((e) => e.engine)).not.toContain('native');
+      expect(events.of('proxy')).toEqual([{ reason: 'cors' }]);
+      expect(events.of('reconnecting')).toHaveLength(0);
+      expect(events.of('error')).toHaveLength(0);
+      expect(player.attempt).toBe(0);
+
+      const viaRelay = lastHls();
+      expect(mocks.hls).toHaveLength(2);
+      expect(viaRelay.url).toBe(NAMED);
+      expect(viaRelay.config.loader).toBe(makeProxyLoader(Hls, PROXY));
+      expect(viaRelay.config.manifestLoadPolicy.default).toMatchObject({
+        maxTimeToFirstByteMs: Infinity,
+        errorRetry: { maxNumRetry: 2 },
+      });
+      expect(player.viaProxy).toBe(true);
+      expect(player.url).toBe(NAMED);
+      viaRelay.emit('hlsManifestParsed', {});
+      ctl.startPlaying();
+      expect(player.state).toBe('playing');
+      expect(player.getStats()).toMatchObject({ url: NAMED, viaProxy: true });
+    });
+
+    it('switches when the https version times out or answers with an error', async () => {
+      const timedOut = setup({ streamProxy: PROXY });
+      await player.load({ url: NAMED });
+      lastHls().emit('hlsError', netError('manifestLoadTimeOut', undefined));
+      await flush();
+      expect(timedOut.events.of('proxy')).toEqual([{ reason: 'timeout' }]);
+      expect(lastHls().url).toBe(NAMED);
+      expect(player.viaProxy).toBe(true);
+
+      const notFound = setup({ streamProxy: PROXY });
+      await player.load({ url: NAMED });
+      lastHls().emit('hlsError', manifestError(404));
+      await flush();
+      expect(notFound.events.of('proxy')).toEqual([{ reason: 'http-404' }]);
+      expect(notFound.events.of('reconnecting')).toHaveLength(0);
+      expect(player.viaProxy).toBe(true);
+    });
+
+    it('skips the remaining engines once hls.js can’t reach the https version', async () => {
+      const unknown = 'http://xtream.example.com/u/p/1001';
+      const { events } = setup({ streamProxy: PROXY });
+      await player.load({ url: unknown });
+      expect(player.engine).toBe('native'); // native → hls.js → mpegts.js, on the https URL
+      expect(ctl.video.getAttribute('src')).toBe('https://xtream.example.com/u/p/1001');
+      ctl.fail(4); // ambiguous: the next engine may still play it
+      await flush();
+      expect(player.engine).toBe('hls.js');
+      lastHls().emit('hlsError', manifestError(0));
+      await flush(50);
+      expect(events.of('proxy')).toEqual([{ reason: 'cors' }]);
+      expect(mocks.ts).toHaveLength(0); // mpegts.js never tried the https URL
+      expect(player.engine).toBe('native');
+      expect(ctl.video.getAttribute('src')).toBe(relayed(unknown));
+    });
+
+    it('gives the https version 10 s to show a first frame on any engine, then switches to the relay', async () => {
+      vi.useFakeTimers();
+      for (const url of ['http://tv.example.com/live/1.ts', 'http://tv.example.com/movie.mp4', NAMED]) {
+        const { events } = setup({ streamProxy: PROXY });
+        await player.load({ url });
+        expect(player.url, url).toBe(url.replace('http://', 'https://'));
+        await vi.advanceTimersByTimeAsync(9000);
+        expect(events.of('proxy'), url).toHaveLength(0);
+        await vi.advanceTimersByTimeAsync(1500);
+        // Straight to the relay with the original URL (no other engine tries the https version first).
+        expect(events.of('proxy'), url).toEqual([{ reason: 'timeout' }]);
+        expect(player.viaProxy, url).toBe(true);
+        expect(player.url, url).toBe(url);
+        expect(events.of('reconnecting'), url).toHaveLength(0);
+      }
+      // Through the relay (and without a relay) the usual patience applies.
+      const relayed = setup({ streamProxy: PROXY });
+      await player.load({ url: 'http://8.8.4.4/live/1.ts' });
+      await vi.advanceTimersByTimeAsync(20000);
+      expect(relayed.events.of('error')).toHaveLength(0);
+      expect(relayed.events.of('reconnecting')).toHaveLength(0);
+      const plain = setup();
+      await player.load({ url: 'http://tv.example.com/live/1.ts' });
+      await vi.advanceTimersByTimeAsync(20000);
+      expect(plain.events.of('error')).toHaveLength(0);
+      expect(plain.events.of('reconnecting')).toHaveLength(0);
+    });
+
+    it('keeps playing the https version when it works, also across reconnects', async () => {
+      vi.useFakeTimers();
+      const { events } = setup({ streamProxy: PROXY });
+      await player.load({ url: NAMED });
+      lastHls().emit('hlsManifestParsed', {});
+      ctl.startPlaying();
+      expect(player.state).toBe('playing');
+      expect(player.viaProxy).toBe(false);
+      lastHls().emit('hlsError', netError('fragLoadError', 0)); // in-place startLoad() first
+      lastHls().emit('hlsError', netError('fragLoadError', 0));
+      await flush();
+      expect(events.of('reconnecting')[0]).toMatchObject({ attempt: 1, code: 'NETWORK' });
+      await vi.advanceTimersByTimeAsync(events.of('reconnecting')[0].delayMs);
+      const again = lastHls();
+      expect(again.url).toBe(UPGRADED);
+      expect(again.config.loader).toBeUndefined();
+      // It played over https: nothing to fall back to, so the usual patience is back.
+      expect(again.config.manifestLoadPolicy.default.maxTimeToFirstByteMs).toBe(Infinity);
+      expect(events.of('proxy')).toHaveLength(0);
+    });
+
+    it('keeps failures a relay can’t fix', async () => {
+      const { events } = setup({ streamProxy: PROXY });
+      await player.load({ url: NAMED });
+      lastHls().emit('hlsError', { type: 'mediaError', details: 'manifestIncompatibleCodecsError', fatal: true });
+      await flush();
+      expect(player.error.code).toBe('UNSUPPORTED');
+      expect(player.error).not.toHaveProperty('viaProxy');
+      expect(events.of('proxy')).toHaveLength(0);
+    });
+
+    it('goes straight to the relay for IP addresses and when upgrades are off', async () => {
+      for (const [url, options] of [
+        [NAMED, { upgradeInsecure: false }],
+        ['http://[2001:db8::1]:8080/live/index.m3u8', {}],
+        ['http://8.8.4.4/live/index.m3u8', {}],
+      ]) {
+        const { events } = setup({ streamProxy: PROXY, ...options });
+        await player.load({ url });
+        expect(lastHls().url, url).toBe(url);
+        expect(lastHls().config.loader, url).toBeTypeOf('function');
+        expect(player.viaProxy, url).toBe(true);
+        expect(events.of('proxy'), url).toHaveLength(0);
+      }
+    });
+
+    it('behaves as before without a relay: patient https attempt, then MIXED_CONTENT', async () => {
+      setup({}, { nativeHls: 'maybe' });
+      await player.load({ url: NAMED });
+      expect(lastHls().config.manifestLoadPolicy.default).toMatchObject({
+        maxTimeToFirstByteMs: Infinity,
+        errorRetry: { maxNumRetry: 2 },
+      });
+      lastHls().emit('hlsError', manifestError(0));
+      await flush();
+      expect(player.engine).toBe('native'); // the next engine still gets its chance
+      expect(ctl.video.getAttribute('src')).toBe(UPGRADED);
+      ctl.fail(4);
+      await flush();
+      expect(player.error).toMatchObject({ code: 'MIXED_CONTENT', canUseProxy: true });
+      expect(player.viaProxy).toBe(false);
+    });
+  });
+
+  describe('local-network streams', () => {
+    const LAN = 'http://192.168.1.20:9981/stream/channel/1.m3u8';
+    const LOCAL_DETAIL =
+      'This stream is on your local network. Browsers block insecure streams on secure sites; open the player ' +
+      'over http on your network (e.g. run it locally) to watch it.';
+
+    it('never sends them to the relay: they try https, then fail as blocked, flagged as local', async () => {
+      for (const streamProxy of [PROXY, '']) {
+        const { events } = setup({ streamProxy, autoReconnect: false }, { nativeHls: 'maybe' });
+        await player.load({ url: LAN });
+        const hls = lastHls();
+        expect(hls.url).toBe('https://192.168.1.20:9981/stream/channel/1.m3u8');
+        expect(hls.config.loader).toBeUndefined();
+        expect(hls.config.manifestLoadPolicy.default.maxTimeToFirstByteMs).toBe(Infinity);
+        expect(player.viaProxy).toBe(false);
+        hls.emit('hlsError', manifestError(0));
+        await flush();
+        expect(player.engine).toBe('native');
+        ctl.fail(4);
+        await flush();
+        expect(player.state).toBe('error');
+        expect(player.error).toMatchObject({ code: 'MIXED_CONTENT', detail: LOCAL_DETAIL, localNetwork: true });
+        expect(player.error).not.toHaveProperty('canUseProxy');
+        expect(player.error).not.toHaveProperty('viaProxy');
+        expect(events.of('proxy')).toHaveLength(0);
+        expect(player.viaProxy).toBe(false);
+      }
+    });
+
+    it('fails right away when https upgrades are off, with or without a relay', async () => {
+      for (const streamProxy of [PROXY, '']) {
+        const urls = [LAN, 'http://nas.local:8096/live.ts', 'http://[fd00::12]/x.m3u8', 'http://tvheadend:9981/s/1'];
+        for (const url of urls) {
+          setup({ streamProxy, upgradeInsecure: false });
+          await player.load({ url });
+          expect(mocks.hls, url).toHaveLength(0);
+          expect(player.error, url).toEqual({
+            code: 'MIXED_CONTENT',
+            message: 'This channel uses an insecure HTTP stream, which browsers block on secure (HTTPS) pages.',
+            detail: LOCAL_DETAIL,
+            fatal: true,
+            localNetwork: true,
+          });
+        }
+      }
+    });
+
+    it('does not switch secure local streams to the relay either (it can’t reach them)', async () => {
+      const { events } = setup({ streamProxy: PROXY, autoReconnect: false });
+      await player.load({ url: 'https://192.168.1.20/live/index.m3u8' });
+      lastHls().emit('hlsError', manifestError(0));
+      await flush();
+      expect(events.of('proxy')).toHaveLength(0);
+      expect(player.error).toMatchObject({ code: 'CORS', localNetwork: true });
+      expect(player.error).not.toHaveProperty('canUseProxy');
+      expect(player.error).not.toHaveProperty('viaProxy');
+    });
+
+    it('plays them directly on http pages, where nothing blocks them', async () => {
+      setup({ streamProxy: PROXY, pageProtocol: 'http:' });
+      await player.load({ url: LAN });
+      expect(lastHls().url).toBe(LAN);
+      expect(lastHls().config.loader).toBeUndefined();
+      expect(player.viaProxy).toBe(false);
+    });
+  });
+
+  it('ignores unusable relay settings', () => {
+    setup({ streamProxy: 'ftp://relay.example/' });
+    expect(player.options.streamProxy).toBe('');
+    player.setOptions({ streamProxy: '  https://relay.example/?url=  ' });
+    expect(player.options.streamProxy).toBe('https://relay.example/?url=');
+    player.setOptions({ streamProxy: 42 });
+    expect(player.options.streamProxy).toBe('');
+    player.setOptions({ streamProxy: 'relay.example' });
+    expect(player.options.streamProxy).toBe('');
   });
 });
 

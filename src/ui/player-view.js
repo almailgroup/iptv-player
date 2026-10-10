@@ -26,13 +26,14 @@ import {
   safeImageUrl,
 } from '../lib/utils.js';
 import { APP_NAME, CATEGORY } from '../app/constants.js';
+import { effectiveRelay, hasBuiltinRelay, isBuiltinRelayActive, streamRelay } from '../app/relay.js';
 import { isFavorite, selectVisibleChannels } from '../app/selectors.js';
 import { SHORTCUTS } from '../app/shortcuts-list.js';
 import { Player, PlayerErrorCode, PlayerState } from '../player/player.js';
 import { icon, setIcon } from './icons.js';
 import { openMenu } from './popover.js';
 import { toast } from './toast.js';
-import { openAddPlaylistDialog } from './dialogs.js';
+import { openAddPlaylistDialog, openProxyGuide, openSettingsDialog, proxyHealthUrl } from './dialogs.js';
 
 const HIDE_DELAY = 2800; // controls auto-hide while playing (mouse)
 const TOUCH_HIDE_DELAY = 3600; // a little longer on touch — there is no hover to bring them back
@@ -71,6 +72,7 @@ const TIP_LABELS = {
 const STAT_ROWS = [
   ['state', 'State'],
   ['engine', 'Engine'],
+  ['route', 'Route'],
   ['mode', 'Stream'],
   ['resolution', 'Resolution'],
   ['bitrate', 'Bitrate'],
@@ -92,7 +94,82 @@ const REASONS = {
   timeout: 'The stream took too long to respond.',
 };
 
+/** MIXED_CONTENT detail copy (the Player's own detail doesn't know about the relay settings). */
+const MIXED_DETAIL = {
+  upgraded: 'Its HTTPS version didn’t work either. ',
+  noRelay:
+    'Set up your own free relay to play it here (about 5 minutes), or use an HTTPS link if your provider ' +
+    'offers one.',
+  builtinOff:
+    'Turn the built-in relay back on in Settings to play it here, or use an HTTPS link if your provider ' +
+    'offers one.',
+  streamsOff: 'Turn on “Play blocked streams through the relay” in Settings to play it here.',
+  relayReady: 'A relay is set up now — press Retry to play it through the relay.',
+};
+/** Copy for streams that failed through the relay (names the relay in use, unlike the Player's wording). */
+const RELAY_FAILED = {
+  builtin: {
+    message: 'Couldn’t play this stream through the built-in relay.',
+    detail: 'The stream may be offline, region-locked, or refusing relays. Try again later.',
+  },
+  own: {
+    message: 'Couldn’t play this stream through your relay.',
+    detail:
+      'Check that your relay’s address is correct and that it’s running (Settings → Network), or try ' +
+      'again later.',
+  },
+  // The relay it failed through has been switched off or removed since.
+  gone: {
+    message: 'Couldn’t play this stream through the relay.',
+    detail: 'Try again, or pick another channel.',
+  },
+};
+/**
+ * Copy for a failure through a relay that doesn't answer at all — its health check failed too: it is down, out
+ * of its free quota, or blocked on this network. That is the relay's problem, not the channel's.
+ */
+const RELAY_DOWN = {
+  builtin: {
+    title: 'Relay unavailable',
+    message: 'Couldn’t reach the built-in relay.',
+    detail: 'It may be down or busy right now. Try again in a few minutes.',
+  },
+  own: {
+    title: 'Relay unavailable',
+    message: 'Couldn’t reach your relay.',
+    detail: 'Check that it’s running and that its address is correct (Settings → Network), or try again later.',
+  },
+};
+/** Upper bound for the relay health check that follows a failure through the relay (see mayBeRelayDown). */
+const RELAY_PROBE_TIMEOUT_MS = 8000;
+/** How many channels (stream URLs) the once-per-channel "Playing through your relay" notice remembers. */
+const PROXY_NOTICE_LIMIT = 200;
+/**
+ * Fatal errors that say nothing about the channel itself, so they aren't remembered as failures: blocked
+ * autoplay, being offline, and blocked insecure streams: without a relay (the list flags those as "HTTP"
+ * already — a stored failure would outlive setting a relay up) or on the local network (flagged "Local").
+ */
+const UNREPORTED_ERRORS = new Set([E.AUTOPLAY, E.OFFLINE, E.MIXED_CONTENT]);
+
 let instances = 0;
+
+/**
+ * Which relay is in play for the error panel and status copy (see src/app/relay.js).
+ * @returns {{ any: boolean, streams: boolean, builtin: boolean, own: boolean, builtinOff: boolean }}
+ *   `any`: some relay is set (own or built-in); `streams`: streams may play through it; `builtin`: that
+ *   relay is this site's built-in one; `own`: the user set their own; `builtinOff`: the site has a built-in
+ *   relay but the user switched it off (and has no own relay).
+ */
+function relayContext(settings = {}) {
+  const any = !!effectiveRelay(settings);
+  return {
+    any,
+    streams: !!streamRelay(settings),
+    builtin: isBuiltinRelayActive(settings),
+    own: !!String(settings.corsProxy || '').trim(),
+    builtinOff: !any && hasBuiltinRelay(),
+  };
+}
 
 /** Map store settings to Player options (SPEC §3.4 constructor options). */
 function playerOptionsFrom(settings = {}) {
@@ -104,6 +181,7 @@ function playerOptionsFrom(settings = {}) {
     upgradeInsecure: settings.upgradeInsecure !== false,
     lowLatency: settings.lowLatency !== false,
     preferNativeHls: !!settings.preferNativeHls,
+    streamProxy: streamRelay(settings),
   };
 }
 
@@ -173,21 +251,96 @@ function reasonText(reason) {
   return /\s/.test(value) && value.length <= 160 ? value : '';
 }
 
-/** Copy + presentation for a Player error. */
-function describeError(error) {
+/**
+ * The relay couldn't fetch the stream (unreachable, blocked or refused) — the Player's generic "couldn't play
+ * through the relay" failures, as opposed to specific answers such as a 404 that came back through it.
+ */
+function isRelayReachFailure(error) {
+  if (!error?.viaProxy) return false;
+  if (error.code === E.NETWORK || error.code === E.CORS) return true;
+  const status = Number(error.status) || 0;
+  return error.code === E.HTTP && (status === 401 || status === 403);
+}
+
+/**
+ * A failure through the relay that came with no HTTP status at all. The relay answers every request it
+ * receives — upstream failures included (502, 404 …), with CORS headers — so this may mean that the relay
+ * itself didn't answer (down, over its quota, blocked on this network), or that the stream kept it waiting
+ * until the player gave up. Its health check tells the two apart.
+ */
+function mayBeRelayDown(error) {
+  return isRelayReachFailure(error) && !(Number(error?.status) > 0);
+}
+
+const NO_RELAY = Object.freeze({
+  any: false,
+  streams: false,
+  builtin: false,
+  own: false,
+  builtinOff: false,
+  down: false,
+});
+
+/** RELAY_FAILED (or, once its health check failed, RELAY_DOWN) copy for the relay in use. */
+function relayFailureCopy(relay) {
+  if (relay.down && (relay.builtin || relay.own)) return relay.builtin ? RELAY_DOWN.builtin : RELAY_DOWN.own;
+  if (relay.builtin) return RELAY_FAILED.builtin;
+  return relay.own ? RELAY_FAILED.own : RELAY_FAILED.gone;
+}
+
+/**
+ * The Player's reconnect reasons carry its own wording for relay failures ("Couldn’t play this stream through
+ * the relay.") and no other hint: reword that one for the relay in use, pass everything else through.
+ */
+function relayAwareReason(text, relay) {
+  return /\bthrough (?:the|your) (?:relay|proxy)\b/i.test(text) ? relayFailureCopy(relay).message : text;
+}
+
+/**
+ * Copy + presentation for a Player error.
+ * @param {object} error the Player's public error
+ * @param {ReturnType<typeof relayContext> & { down?: boolean }} [relay] the relay settings right now (see
+ *   relayContext()); `down`: the relay's health check failed after this error (see mayBeRelayDown())
+ */
+function describeError(error, relay = NO_RELAY) {
   const code = error?.code;
   const status = Number(error?.status) || 0;
-  const out = { title: 'Something went wrong', icon: 'alert', kind: 'danger', skip: false, fallback: '' };
+  const out = {
+    title: 'Something went wrong',
+    icon: 'alert',
+    kind: 'danger',
+    skip: false,
+    fallback: '',
+    detail: undefined,
+  };
   if (code != null) {
     switch (code) {
-      case E.MIXED_CONTENT:
+      case E.MIXED_CONTENT: {
+        if (error?.localNetwork) {
+          // On the local network: no relay can reach it. The Player's detail says what does work.
+          Object.assign(out, {
+            title: 'Blocked insecure stream',
+            kind: 'warning',
+            skip: true,
+            fallback: 'This channel uses an insecure HTTP stream, which browsers block on secure (HTTPS) pages.',
+          });
+          break;
+        }
+        const upgraded = /\bhttps version\b/i.test(String(error?.detail || ''));
+        let advice = MIXED_DETAIL.noRelay;
+        if (relay.streams) advice = MIXED_DETAIL.relayReady;
+        else if (relay.any) advice = MIXED_DETAIL.streamsOff;
+        else if (relay.builtinOff) advice = MIXED_DETAIL.builtinOff;
         Object.assign(out, {
           title: 'Blocked insecure stream',
           kind: 'warning',
-          skip: true,
+          // Without a relay nothing changes on retry; once one is on, retrying is the fix.
+          skip: !relay.streams,
           fallback: 'This channel uses an insecure HTTP stream, which browsers block on secure (HTTPS) pages.',
+          detail: (upgraded ? MIXED_DETAIL.upgraded : '') + advice,
         });
         break;
+      }
       case E.UNSUPPORTED:
         Object.assign(out, {
           title: 'Format not supported',
@@ -259,14 +412,23 @@ function describeError(error) {
         break;
     }
   }
-  const message = (typeof error?.message === 'string' && error.message.trim()) || out.fallback ||
-    'The stream stopped unexpectedly.';
+  // The Player says "the relay" for every relay failure; name the relay that's actually in use.
+  const relayCopy = isRelayReachFailure(error) ? relayFailureCopy(relay) : null;
+  if (relayCopy?.title) out.title = relayCopy.title;
+  const message = relayCopy?.message || (typeof error?.message === 'string' && error.message.trim()) ||
+    out.fallback || 'The stream stopped unexpectedly.';
   const details = [];
-  if (typeof error?.detail === 'string' && error.detail.trim() && error.detail.trim() !== message) {
-    details.push(error.detail.trim());
-  }
+  const detail = relayCopy ? relayCopy.detail : typeof out.detail === 'string' ? out.detail : error?.detail;
+  if (typeof detail === 'string' && detail.trim() && detail.trim() !== message) details.push(detail.trim());
   if (status && !message.includes(String(status))) details.push(`HTTP ${status}`);
   return { ...out, message, detail: details.join(' · ') };
+}
+
+/** Blocked by the browser (insecure stream on a secure page, or no CORS) — what a stream relay fixes, except
+ * on the local network (a relay can't reach it). */
+function isProxyFixable(error) {
+  if (!error || error.viaProxy || error.localNetwork) return false;
+  return !!error.canUseProxy || error.code === E.MIXED_CONTENT || error.code === E.CORS;
 }
 
 /**
@@ -324,6 +486,10 @@ export function createPlayerView({ store, actions }) {
   let iosFullscreen = false;
   let orientationLocked = false;
   let navAvailable = false;
+  let proxyNotice = ''; // stream URL that switched to the relay and hasn't played yet ('proxy' event)
+  const proxyNoticed = new Set(); // stream URLs that already showed the "through your relay" toast
+  let reportFor = null; // channel of the current load (health reports: markChannelOk / markChannelFailed)
+  let reportedOk = false; // its playing state was reported since the load started / last failed
   let destroyed = false;
 
   const hasChannel = () => !!store.get().currentChannel;
@@ -332,6 +498,12 @@ export function createPlayerView({ store, actions }) {
   const markVolumeIntent = () => {
     volumeIntentAt = performance.now();
   };
+  const viaProxy = () => player.viaProxy === true;
+  const relayNow = () => relayContext(store.get().settings || {});
+  let relayProbe = null; // { controller, timer } of the pending relay health check (see checkRelayThenReport)
+  let relayDownError = null; // the error after which the relay's health check failed too
+  /** relayNow() for presenting `err`: also tells whether the relay turned out to be unreachable then. */
+  const relayFor = (err) => ({ ...relayNow(), down: !!err && err === relayDownError });
 
   // ---- Shared button helpers ------------------------------------------------------------------------------
   /**
@@ -548,7 +720,35 @@ export function createPlayerView({ store, actions }) {
     icon('copy', { size: 15 }),
     'Copy stream URL',
   );
-  const errActions = h('div', { class: 'pv-error-actions' }, errRetryBtn, errNextBtn, errCopyBtn);
+  // Blocked by the browser and no relay at all → the setup guide; a relay that's switched off, or the user's
+  // own relay failed → the relay settings.
+  const errProxyBtn = h(
+    'button',
+    { type: 'button', class: 'btn btn-sm pv-err-btn pv-err-proxy', onClick: () => openProxyFix() },
+    icon('broadcast', { size: 15 }),
+    'Fix with a relay',
+  );
+  const errProxySettingsBtn = h(
+    'button',
+    { type: 'button', class: 'btn btn-sm pv-err-btn pv-err-proxy', onClick: () => openProxySettings() },
+    icon('settings', { size: 15 }),
+    'Relay settings',
+  );
+  const errActions = h(
+    'div',
+    { class: 'pv-error-actions' },
+    errRetryBtn,
+    errNextBtn,
+    errProxyBtn,
+    errProxySettingsBtn,
+    errCopyBtn,
+  );
+  /** Classes a button keeps whatever its rank in the error panel. */
+  const errBtnClass = new Map([
+    [errCopyBtn, ' pv-err-copy'],
+    [errProxyBtn, ' pv-err-proxy'],
+    [errProxySettingsBtn, ' pv-err-proxy'],
+  ]);
   const errorPanel = h(
     'div',
     { class: 'pv-error', role: 'group', 'aria-labelledby': errTitleId },
@@ -929,7 +1129,7 @@ export function createPlayerView({ store, actions }) {
     } else if (next === 'paused' && autoplayBlocked) announce('Autoplay was blocked. Press play to start.');
     else if (next === 'paused' && (prev === 'playing' || prev === 'buffering')) announce('Paused');
     else if (next === 'error') {
-      const info = describeError(currentError());
+      const info = describeError(currentError(), relayFor(currentError()));
       announce(`${info.title}. ${info.message}`);
       // If the user was operating the player by keyboard, move focus to the primary recovery action.
       const ae = document.activeElement;
@@ -945,14 +1145,17 @@ export function createPlayerView({ store, actions }) {
     const st = viewState;
     statusRetryBtn.hidden = st !== 'reconnecting';
     if (st === 'loading') {
-      setText(statusText, reconnect ? reconnectLabel() : 'Connecting…');
+      const connecting = viaProxy() ? 'Connecting via relay…' : 'Connecting…';
+      setText(statusText, reconnect ? reconnectLabel() : connecting);
       setText(statusSub, currentChannel()?.name || '');
     } else if (st === 'buffering') {
       setText(statusText, 'Buffering…');
       setText(statusSub, '');
     } else if (st === 'reconnecting') {
       setText(statusText, reconnectLabel());
-      const sub = isOffline() ? 'Waiting for the network to come back…' : reasonText(reconnect?.reason);
+      const sub = isOffline()
+        ? 'Waiting for the network to come back…'
+        : relayAwareReason(reasonText(reconnect?.reason), relayNow());
       setText(statusSub, sub);
     }
   }
@@ -1000,21 +1203,41 @@ export function createPlayerView({ store, actions }) {
 
   function renderError() {
     const err = currentError();
-    const info = describeError(err);
+    const relay = relayFor(err);
+    const info = describeError(err, relay);
     root.dataset.error = info.kind;
     swapIcon(errIcon, info.icon, 22);
     setText(errTitle, info.title);
     setText(errMessage, info.message);
     setText(errDetail, info.detail);
     errDetail.hidden = !info.detail;
-    const primary = info.skip ? errNextBtn : errRetryBtn;
-    const secondary = info.skip ? errRetryBtn : errNextBtn;
-    primary.className = 'btn btn-primary btn-sm pv-err-btn';
-    secondary.className = 'btn btn-sm pv-err-btn pv-glass';
-    if (errActions.firstElementChild !== primary) errActions.prepend(primary);
-    if (primary.nextElementSibling !== secondary) primary.after(secondary);
-    errNextBtn.disabled = !navAvailable;
+
+    // Blocked by the browser and streams can't use a relay right now: offer the fix first — the setup guide
+    // when there's no relay at all, else Settings (a relay that's switched off). Retrying an insecure stream
+    // can't help until then. The user's own relay failing also points to Settings; the built-in one doesn't
+    // (there's nothing to configure), only Retry / Next channel.
+    const fixable = isProxyFixable(err) && !relay.streams;
+    const offerGuide = fixable && !relay.any && !relay.builtinOff;
+    const offerSettings = (fixable && !offerGuide) || (!!err?.viaProxy && relay.own);
+    const first = info.skip ? errNextBtn : errRetryBtn;
+    const second = info.skip ? errRetryBtn : errNextBtn;
+    const order = [first, second, errProxySettingsBtn, errProxyBtn, errCopyBtn];
+    const lead = offerGuide ? errProxyBtn : fixable ? errProxySettingsBtn : null;
+    if (lead) order.unshift(...order.splice(order.indexOf(lead), 1));
+    errProxyBtn.hidden = !offerGuide;
+    errProxySettingsBtn.hidden = !offerSettings;
+    // Retrying a blocked insecure stream changes nothing: not before a relay is on, never on the local network.
+    errRetryBtn.hidden = (fixable || !!err?.localNetwork) && err?.code === E.MIXED_CONTENT;
     errCopyBtn.hidden = !currentChannel()?.url;
+    order.forEach((btn, i) => {
+      const rank = i === 0 ? 'btn btn-primary btn-sm pv-err-btn' : 'btn btn-sm pv-err-btn pv-glass';
+      const cls = rank + (errBtnClass.get(btn) || '');
+      if (btn.className !== cls) btn.className = cls;
+      // Reorder in place only when needed: moving a focused button would drop its focus.
+      if (errActions.children[i] !== btn) errActions.insertBefore(btn, errActions.children[i] || null);
+    });
+    setData(errActions, 'crowded', order.filter((btn) => !btn.hidden).length > 3);
+    errNextBtn.disabled = !navAvailable;
   }
 
   // ---- Timeline (live badge, VOD time, seek bar) ----------------------------------------------------------
@@ -1499,6 +1722,8 @@ export function createPlayerView({ store, actions }) {
 
     setStat('state', viewState.charAt(0).toUpperCase() + viewState.slice(1));
     setStat('engine', st.engine || player.engine || '');
+    const relayed = typeof st.viaProxy === 'boolean' ? st.viaProxy : viaProxy();
+    setStat('route', relayed ? 'Via relay' : hasChannel() && viewState !== 'idle' ? 'Direct' : '');
     setStat('mode', media ? (live() ? (player.canSeek ? 'Live · DVR' : 'Live') : 'On demand') : '');
     setStat('resolution', width && height ? `${width} × ${height}` : '');
     const bitrate = formatBitrate(Number(st.bitrate));
@@ -1674,9 +1899,11 @@ export function createPlayerView({ store, actions }) {
   }
 
   function statusSummary() {
+    const route = viaProxy() ? 'via relay' : '';
     switch (viewState) {
       case 'loading':
-        return { kind: 'wait', text: reconnect ? 'Reconnecting…' : 'Connecting…' };
+        if (reconnect) return { kind: 'wait', text: 'Reconnecting…' };
+        return { kind: 'wait', text: route ? 'Connecting via relay…' : 'Connecting…' };
       case 'buffering':
         return { kind: 'wait', text: 'Buffering…' };
       case 'reconnecting':
@@ -1686,19 +1913,21 @@ export function createPlayerView({ store, actions }) {
           text: reconnect?.attempt ? `Reconnecting · ${reconnect.attempt}/${reconnect.max}` : 'Reconnecting…',
         };
       case 'error':
-        return { kind: 'error', text: describeError(currentError()).title };
+        return { kind: 'error', text: describeError(currentError(), relayFor(currentError())).title };
       case 'paused':
         if (autoplayBlocked) return { kind: 'paused', text: 'Press play to start' };
         return {
           kind: 'paused',
-          text: ['Paused', live() ? 'Live' : '', resolutionLabel()].filter(Boolean).join(' · '),
+          text: ['Paused', live() ? 'Live' : '', resolutionLabel(), route].filter(Boolean).join(' · '),
         };
       case 'ready':
         return { kind: 'paused', text: 'Ready to play' };
       case 'playing':
         return {
           kind: live() ? 'live' : 'ok',
-          text: [live() ? 'Live' : 'On demand', resolutionLabel(), player.engine].filter(Boolean).join(' · '),
+          text: [live() ? 'Live' : 'On demand', resolutionLabel(), player.engine, route]
+            .filter(Boolean)
+            .join(' · '),
         };
       default:
         return { kind: 'idle', text: '' };
@@ -1746,6 +1975,137 @@ export function createPlayerView({ store, actions }) {
     } catch (err) {
       toast.error(err?.message || "Couldn't open the dialog.");
     }
+  }
+
+  // ---- Stream relay (proxy) -------------------------------------------------------------------------------
+
+  /** "Fix with a relay": the setup guide; once it saved a working relay, replay the blocked channel. */
+  function openProxyFix() {
+    const ch = currentChannel();
+    let handle = null;
+    try {
+      handle = openProxyGuide({ store, actions });
+    } catch (err) {
+      toast.error(err?.message || "Couldn't open the dialog.");
+      return;
+    }
+    retryAfter(handle, ch, (result) => !!result?.working && relayNow().streams);
+  }
+
+  /** "Relay settings": Settings; replay the channel if the relay streams play through changed there. */
+  function openProxySettings() {
+    const ch = currentChannel();
+    const before = streamRelay(store.get().settings || {});
+    let handle = null;
+    try {
+      handle = openSettingsDialog({ store, actions });
+    } catch (err) {
+      toast.error(err?.message || "Couldn't open the dialog.");
+      return;
+    }
+    retryAfter(handle, ch, () => {
+      const after = streamRelay(store.get().settings || {});
+      return !!after && after !== before;
+    });
+  }
+
+  /** When a dialog closes and `shouldRetry(result)`, retry — if the same channel's error is still showing. */
+  function retryAfter(handle, ch, shouldRetry) {
+    Promise.resolve(handle?.result).then(
+      (result) => {
+        if (destroyed || !ch || currentChannel() !== ch || player.state !== S.ERROR) return;
+        if (shouldRetry(result)) retry();
+      },
+      () => {},
+    );
+  }
+
+  /**
+   * "Playing through your relay" — once per channel, when a stream that switched to the user's own relay
+   * starts. The built-in relay is how the site plays such channels by default, so it only shows in the
+   * status line ("via relay") and stream info.
+   */
+  function noticeProxy() {
+    const key = proxyNotice;
+    proxyNotice = '';
+    if (!key || proxyNoticed.has(key) || !viaProxy() || relayNow().builtin) return;
+    if (proxyNoticed.size >= PROXY_NOTICE_LIMIT) proxyNoticed.clear();
+    proxyNoticed.add(key);
+    toast.info('Playing through your relay');
+  }
+
+  // ---- Channel health (the channel list's "Unavailable" flags, see markChannelFailed) -------------------
+
+  /** Mark the channel the current load is for as playable once it plays (again, after a failure). */
+  function reportPlaying() {
+    if (reportedOk || !isReportable()) return;
+    reportedOk = true;
+    actions.markChannelOk?.(reportFor);
+  }
+
+  /** Remember a fatal failure of the current load, titled like the error panel shows it. */
+  function reportFailure(error) {
+    if (!error || error.fatal === false || UNREPORTED_ERRORS.has(error.code) || !isReportable()) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return; // not the channel's fault
+    reportedOk = false;
+    const { title } = describeError(error, relayNow());
+    actions.markChannelFailed?.(reportFor, { code: String(error.code ?? ''), title });
+  }
+
+  /**
+   * A failure through the relay without any HTTP answer (see mayBeRelayDown): before blaming the channel, ask
+   * the relay's health check whether the relay itself is down. A relay outage — or a used-up free quota —
+   * must not flag every channel tried meanwhile as "Unavailable" (and hide them); the error panel then says
+   * that the relay can't be reached instead.
+   */
+  function checkRelayThenReport(error) {
+    cancelRelayProbe();
+    const url = proxyHealthUrl(streamRelay(store.get().settings || {}));
+    if (!url || typeof fetch !== 'function') {
+      reportFailure(error);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RELAY_PROBE_TIMEOUT_MS);
+    const probe = { controller, timer };
+    relayProbe = probe;
+    const seq = loadSeq;
+    let request;
+    try {
+      request = fetch(url, { cache: 'no-store', credentials: 'omit', signal: controller.signal });
+    } catch (err) {
+      request = Promise.reject(err);
+    }
+    Promise.resolve(request)
+      .then(
+        (res) => !!res?.ok,
+        () => false,
+      )
+      .then((reachable) => {
+        if (relayProbe !== probe) return; // cancelled: a new load, Retry, or the view went away
+        cancelRelayProbe();
+        if (destroyed || seq !== loadSeq || currentError() !== error) return;
+        if (reachable) {
+          reportFailure(error);
+          return;
+        }
+        relayDownError = error;
+        renderState();
+        const info = describeError(error, relayFor(error));
+        announce(`${info.title}. ${info.message}`);
+      });
+  }
+
+  function cancelRelayProbe() {
+    if (!relayProbe) return;
+    clearTimeout(relayProbe.timer);
+    relayProbe.controller.abort();
+    relayProbe = null;
+  }
+
+  /** Player events belong to `reportFor` only while it's still the current channel. */
+  function isReportable() {
+    return !!reportFor && currentChannel()?.id === reportFor.id;
   }
 
   async function loadDemo() {
@@ -1896,11 +2256,14 @@ export function createPlayerView({ store, actions }) {
     audioTracks = [];
     currentAudio = -1;
     lastError = null;
+    relayDownError = null;
+    cancelRelayProbe();
     offlineWait = false;
     autoplayBlocked = false;
     behindLive = false;
     liveBaseline = Infinity;
     pausedAt = 0;
+    proxyNotice = '';
     stopCountdown();
     setUnmutePill(false, true);
     scrub = null;
@@ -1921,6 +2284,8 @@ export function createPlayerView({ store, actions }) {
       video.muted = !!store.get().muted;
     }
     pendingLoad = true;
+    reportFor = ch;
+    reportedOk = false;
     publishPlaybackState(S.LOADING); // don't leave the previous channel's state (e.g. 'error') in the store
     renderState();
     let result;
@@ -1951,6 +2316,7 @@ export function createPlayerView({ store, actions }) {
   function stopPlayback() {
     loadSeq++;
     pendingLoad = false;
+    reportFor = null;
     resetStreamUi();
     exitPip();
     try {
@@ -1993,6 +2359,8 @@ export function createPlayerView({ store, actions }) {
     }
     stopCountdown();
     lastError = null;
+    relayDownError = null;
+    cancelRelayProbe();
     try {
       player.retry();
     } catch {
@@ -2202,10 +2570,17 @@ export function createPlayerView({ store, actions }) {
     autoplayBlocked = state === S.PAUSED && reason === 'autoplay-blocked';
     if (state !== S.IDLE) pendingLoad = false;
     if (state === S.PLAYING || state === S.PAUSED || state === S.ERROR || state === S.IDLE) stopCountdown();
+    if (state === S.PLAYING) {
+      noticeProxy();
+      reportPlaying();
+    } else if (state === S.ERROR || state === S.IDLE) proxyNotice = '';
     renderState();
   });
   onPlayer('error', (e) => {
-    lastError = e.detail?.error || player.error || lastError;
+    const error = e.detail?.error || player.error;
+    lastError = error || lastError;
+    if (error?.fatal !== false && mayBeRelayDown(error)) checkRelayThenReport(error);
+    else reportFailure(error);
     renderState();
   });
   onPlayer('reconnecting', (e) => startCountdown(e.detail || {}));
@@ -2246,6 +2621,11 @@ export function createPlayerView({ store, actions }) {
   onPlayer('live', () => {
     renderTimeline();
     renderInfoStatus();
+  });
+  // The direct load failed (CORS, refused…) and the Player switched to the relay: say so once it plays.
+  onPlayer('proxy', () => {
+    proxyNotice = currentChannel()?.url || '';
+    renderState();
   });
   onPlayer('recovered', () => {
     behindLive = false;
@@ -2505,6 +2885,8 @@ export function createPlayerView({ store, actions }) {
         } catch {
           /* ignore */
         }
+        // The error panel's relay actions and copy depend on which relay is in use.
+        if (viewState === 'error') renderError();
       },
     ),
     store.select((s) => s.settings?.showLogos, renderAvatars),
@@ -2540,6 +2922,7 @@ export function createPlayerView({ store, actions }) {
   function destroy() {
     if (destroyed) return;
     destroyed = true;
+    cancelRelayProbe();
     for (const off of unsubs.splice(0)) off();
     for (const off of offs.splice(0)) off();
     clearHideTimer();

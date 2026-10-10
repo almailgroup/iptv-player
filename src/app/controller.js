@@ -22,6 +22,7 @@ import {
   snapshotToChannel,
 } from './selectors.js';
 import { DEMO_M3U, DEMO_PLAYLIST_NAME } from './demo.js';
+import { effectiveRelay } from './relay.js';
 import { groupChannels, makeChannelId, parseM3U, serializeM3U } from '../lib/m3u.js';
 import {
   clearAllData as clearStoredData,
@@ -53,6 +54,13 @@ import { applyTheme } from '../ui/theme.js';
 import { toast } from '../ui/toast.js';
 
 const SESSION_DEBOUNCE_MS = 400;
+const HEALTH_DEBOUNCE_MS = 500;
+/** Remembered playback failures (state.health) are dropped after this long: streams come back. */
+export const HEALTH_TTL_MS = 12 * 3_600_000;
+const MAX_HEALTH_ENTRIES = 1500; // the newest ones are kept
+const MAX_HEALTH_CODE = 32;
+const MAX_HEALTH_TITLE = 120;
+const HEALTH_CLOCK_SKEW_MS = 60_000; // tolerated for entries dated slightly in the future (clock adjustments)
 const LANE_ADD = 'add'; // adding a playlist: a newer add supersedes an older one
 const LANE_CONTENT = 'content'; // downloading the content of the playlist being shown
 const AUTO_REFRESH_DELAY_MS = 4000; // let the first stream start before re-downloading in the background
@@ -96,16 +104,22 @@ const MSG = {
   aborted: 'The download was cancelled.',
   badStreamLink: 'The stream link in the address isn’t a valid http(s) URL.',
   generic: 'Something went wrong. Please try again.',
+  channelFailed: 'This channel didn’t play the last time it was tried.',
 };
 
 const noop = () => {};
 const isObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
 const countLabel = (n) => `${formatCount(n)} ${n === 1 ? 'channel' : 'channels'}`;
 
+/** Collapse whitespace and cap the length ('' when not a string). */
+function cleanText(value, maxLength) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
 /** Collapse whitespace and cap the length of a user/playlist supplied name ('' when not a usable string). */
 function cleanName(value) {
-  if (typeof value !== 'string') return '';
-  return value.replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LENGTH);
+  return cleanText(value, MAX_NAME_LENGTH);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -148,6 +162,9 @@ export function sanitizeSettings(raw) {
     const value = coerceSetting(key, raw[key]);
     if (value !== undefined) settings[key] = value;
   }
+  // Settings from the release before stream relaying have no proxyStreams: their corsProxy was a proxy for
+  // playlist downloads only, so it must not start carrying video. (This release always saves proxyStreams.)
+  if (settings.corsProxy && !Object.hasOwn(raw, 'proxyStreams')) settings.proxyStreams = false;
   return settings;
 }
 
@@ -270,6 +287,45 @@ function sanitizeSnapshots(raw) {
   return out;
 }
 
+const isFreshHealth = (at, now) =>
+  Number.isFinite(at) && now - at <= HEALTH_TTL_MS && at - now <= HEALTH_CLOCK_SKEW_MS;
+
+/** A health map from [channelId, entry] pairs, capped to the newest MAX_HEALTH_ENTRIES (entries as-is). */
+function healthFromEntries(entries) {
+  if (entries.length > MAX_HEALTH_ENTRIES) {
+    entries.sort((a, b) => b[1].at - a[1].at);
+    entries.length = MAX_HEALTH_ENTRIES;
+  }
+  const health = {};
+  for (const [id, entry] of entries) health[id] = entry;
+  return health;
+}
+
+/** Ids usable as health keys: non-empty strings that can't touch the prototype when assigned. */
+const isHealthId = (id) => typeof id === 'string' && id !== '' && id !== '__proto__';
+
+/**
+ * Stored playback-failure memory `{ [channelId]: { code, title, at } }`: plain object of plain-object
+ * entries with a string `code` (≤ 32 chars), string `title` (≤ 120) and finite `at`; anything else, entries
+ * older than HEALTH_TTL_MS (or dated more than a minute ahead) and all but the newest 1500 are dropped.
+ * @param {unknown} raw
+ * @param {number} [now]
+ * @returns {Record<string, { code: string, title: string, at: number }>}
+ */
+export function sanitizeHealth(raw, now = Date.now()) {
+  if (!isObject(raw)) return {};
+  const entries = [];
+  for (const [id, value] of Object.entries(raw)) {
+    if (!isHealthId(id) || !isObject(value)) continue;
+    const { code, title, at } = value;
+    if (typeof code !== 'string' || code.length > MAX_HEALTH_CODE) continue;
+    if (typeof title !== 'string' || title.length > MAX_HEALTH_TITLE) continue;
+    if (!isFreshHealth(at, now)) continue;
+    entries.push([id, { code, title, at }]);
+  }
+  return healthFromEntries(entries);
+}
+
 /**
  * Build the initial app state from localStorage (defaults merged, everything validated). The active
  * playlist's channels are loaded later by `actions.init()`.
@@ -282,6 +338,7 @@ export function createInitialState() {
   const playlists = sanitizePlaylists(readJSON(KEYS.playlists, null));
   const favorites = sanitizeSnapshots(readJSON(KEYS.favorites, null));
   const recents = sanitizeSnapshots(readJSON(KEYS.recents, null)).slice(0, MAX_RECENTS);
+  const health = sanitizeHealth(readJSON(KEYS.health, null));
   const activePlaylistId = playlists.some((p) => p.id === session.activePlaylistId)
     ? session.activePlaylistId
     : (playlists[0]?.id ?? null);
@@ -303,6 +360,8 @@ export function createInitialState() {
     groupSort: session.groupSort,
     favorites,
     recents,
+    // Recent playback failures { [channelId]: { code, title, at } } (markChannelFailed, selectPlayability).
+    health,
     currentChannel: null,
     playRequest: 0,
     // Player state ('idle' | 'loading' | 'playing' | …) published by the player view; never persisted.
@@ -474,7 +533,7 @@ function throwIfAborted(signal) {
 
 /**
  * Create the `actions` API (spec §2) bound to `store`, and install persistence (immediate writes for
- * settings/theme/favorites/recents/playlists, debounced session + pagehide flush, cross-tab sync).
+ * settings/theme/favorites/recents/playlists, debounced session/health + pagehide flush, cross-tab sync).
  * Call `actions.init()` (or `initApp(store, actions)`) once the UI is mounted.
  * @param {ReturnType<import('./store.js').createStore>} store
  */
@@ -529,6 +588,14 @@ export function createController(store) {
   };
   const SESSION_FIELDS = ['activePlaylistId', 'category', 'sort', 'groupSort', 'volume', 'muted'];
 
+  // Health changes come in bursts (a failing channel, then the next one): written debounced, flushed on
+  // pagehide / tab hide like the session.
+  let healthPending = false;
+  const writeHealth = debounce(() => {
+    healthPending = false;
+    save(KEYS.health, get().health);
+  }, HEALTH_DEBOUNCE_MS);
+
   cleanups.push(
     store.subscribe((s, prev) => {
       if (disposed) return;
@@ -547,6 +614,20 @@ export function createController(store) {
     store.select((s) => s.favorites, (value) => save(KEYS.favorites, value)),
     store.select((s) => s.recents, (value) => save(KEYS.recents, value)),
     store.select(
+      (s) => s.health,
+      () => {
+        if (disposed) return;
+        if (applyingRemote) {
+          // Adopted from another tab, which already saved it; a write still pending here would only echo it.
+          writeHealth.cancel();
+          healthPending = false;
+          return;
+        }
+        healthPending = true;
+        writeHealth();
+      },
+    ),
+    store.select(
       (s) => s.theme,
       (theme) => {
         applyTheme(theme);
@@ -555,12 +636,23 @@ export function createController(store) {
     ),
   );
 
-  const flushSession = () => {
-    if (!disposed && sessionPending) writeSession.flush();
+  const flushWrites = () => {
+    if (disposed) return;
+    if (sessionPending) writeSession.flush();
+    if (healthPending) writeHealth.flush();
   };
   const onVisibilityChange = () => {
-    if (document.visibilityState === 'hidden') flushSession();
+    if (document.visibilityState === 'hidden') flushWrites();
+    else pruneHealth(); // a tab resumed after a long sleep shouldn't keep flagging long-expired failures
   };
+
+  /** Drop expired health entries (no state change when none expired). */
+  function pruneHealth() {
+    const now = Date.now();
+    const entries = Object.entries(get().health);
+    const fresh = entries.filter(([, entry]) => isFreshHealth(entry.at, now));
+    if (fresh.length !== entries.length) store.set({ health: healthFromEntries(fresh) });
+  }
 
   /**
    * Another tab saved its playlist list (added, renamed, removed…): adopt it, so a later write from this
@@ -585,7 +677,10 @@ export function createController(store) {
     }
   }
 
-  /** Another tab changed one of our keys: adopt favorites/recents/theme/settings/playlists (no write-back). */
+  /**
+   * Another tab changed one of our keys: adopt favorites/recents/theme/settings/health/playlists (no
+   * write-back).
+   */
   const onStorage = (e) => {
     if (disposed || !e.key) return;
     try {
@@ -608,6 +703,9 @@ export function createController(store) {
     } else if (e.key === KEYS.settings) {
       key = 'settings';
       value = sanitizeSettings(readJSON(KEYS.settings, null));
+    } else if (e.key === KEYS.health) {
+      key = 'health';
+      value = sanitizeHealth(readJSON(KEYS.health, null));
     } else if (e.key === KEYS.playlists) {
       adoptRemotePlaylists(sanitizePlaylists(readJSON(KEYS.playlists, null)));
       return;
@@ -622,11 +720,11 @@ export function createController(store) {
   };
 
   if (typeof window !== 'undefined') {
-    window.addEventListener('pagehide', flushSession);
+    window.addEventListener('pagehide', flushWrites);
     window.addEventListener('storage', onStorage);
     document.addEventListener('visibilitychange', onVisibilityChange);
     cleanups.push(() => {
-      window.removeEventListener('pagehide', flushSession);
+      window.removeEventListener('pagehide', flushWrites);
       window.removeEventListener('storage', onStorage);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     });
@@ -941,7 +1039,8 @@ export function createController(store) {
   async function downloadInto(id, { signal, silent }) {
     const meta = findPlaylist(id);
     if (!meta) return null;
-    const result = await fetchPlaylist(meta.source.url, { signal, corsProxy: get().settings.corsProxy });
+    const corsProxy = effectiveRelay(get().settings);
+    const result = await fetchPlaylist(meta.source.url, { signal, corsProxy });
     throwIfAborted(signal);
     return applyContent(id, result.text, { silent });
   }
@@ -979,7 +1078,7 @@ export function createController(store) {
         try {
           const result = await fetchPlaylist(meta.source.url, {
             signal: controller.signal,
-            corsProxy: get().settings.corsProxy,
+            corsProxy: effectiveRelay(get().settings),
           });
           if (controller.signal.aborted) return;
           const applied = await applyContent(meta.id, result.text, { silent: true });
@@ -1201,7 +1300,8 @@ export function createController(store) {
       return runTask(
         'Downloading playlist…',
         async (signal) => {
-          const result = await fetchPlaylist(normalized, { signal, corsProxy: get().settings.corsProxy });
+          const corsProxy = effectiveRelay(get().settings);
+          const result = await fetchPlaylist(normalized, { signal, corsProxy });
           throwIfAborted(signal);
           // Remember the https:// form when the loader had to upgrade an http:// link on an https page.
           const sourceUrl = result.upgraded ? normalized.replace(/^http:/i, 'https:') : normalized;
@@ -1323,7 +1423,7 @@ export function createController(store) {
           text = serializeM3U(s.channels, { title: meta.name, epgUrl: meta.epgUrl });
         } else if (meta.source.kind === 'url') {
           text = await runTask(`Downloading “${meta.name}”…`, async (signal) => {
-            const { corsProxy } = get().settings;
+            const corsProxy = effectiveRelay(get().settings);
             const result = await fetchPlaylist(meta.source.url, { signal, corsProxy });
             throwIfAborted(signal);
             return parseContent(result.text, meta.source, meta.name).text;
@@ -1425,6 +1525,45 @@ export function createController(store) {
       if (get().recents.length) store.set({ recents: [] });
     },
 
+    // Channel health -------------------------------------------------------------------------------------
+
+    /**
+     * Remember that a channel failed to play (shown as "Unavailable" in the list, and hidden with
+     * `settings.hideUnplayable`) until it plays again or HEALTH_TTL_MS pass. Updates an existing entry.
+     * @param {{ id: string }} channel
+     * @param {{ code?: string, title?: string }} [details] the player's error code and the message shown
+     */
+    markChannelFailed(channel, { code, title } = {}) {
+      const id = channel?.id;
+      if (!isHealthId(id)) return;
+      const now = Date.now();
+      const entry = {
+        code: cleanText(code, MAX_HEALTH_CODE),
+        title: cleanText(title, MAX_HEALTH_TITLE) || MSG.channelFailed,
+        at: now,
+      };
+      store.set((s) => {
+        const entries = Object.entries(s.health).filter(([key, e]) => key !== id && isFreshHealth(e.at, now));
+        entries.push([id, entry]);
+        return { health: healthFromEntries(entries) };
+      });
+    },
+
+    /** Forget a channel's failure once it plays (no state change when there was none). */
+    markChannelOk(channel) {
+      const id = channel?.id;
+      const { health } = get();
+      if (typeof id !== 'string' || !Object.hasOwn(health, id)) return;
+      const next = { ...health };
+      delete next[id];
+      store.set({ health: next });
+    },
+
+    /** Forget every remembered failure. */
+    clearHealth() {
+      if (Object.keys(get().health).length) store.set({ health: {} });
+    },
+
     // Theme & settings -----------------------------------------------------------------------------------
 
     setAccent(accent) {
@@ -1461,6 +1600,7 @@ export function createController(store) {
     clearAllData() {
       disposed = true;
       writeSession.cancel();
+      writeHealth.cancel();
       abortAll();
       clearStoredData();
       try {
@@ -1472,9 +1612,10 @@ export function createController(store) {
 
     /** Flush pending writes and remove every listener/timer (tests, hot reload). */
     destroy() {
-      flushSession();
+      flushWrites();
       disposed = true;
       writeSession.cancel();
+      writeHealth.cancel();
       abortAll();
       background.clear();
       for (const timer of timers) clearTimeout(timer);
