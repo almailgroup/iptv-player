@@ -1,9 +1,9 @@
 // Popovers & menus: Tab leaving a panel continues from its anchor; menu labels form valid ARIA groups.
-// Toasts: the auto-dismiss timer holds while a toast has keyboard focus.
+// Toasts: the auto-dismiss timer holds while a toast has keyboard focus; long messages get a sub-line.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { closePopover, openMenu, openPopover } from '../src/ui/popover.js';
-import { toast } from '../src/ui/toast.js';
+import { splitMessage, toast } from '../src/ui/toast.js';
 
 const tab = (shiftKey = false) =>
   document.activeElement.dispatchEvent(
@@ -111,5 +111,43 @@ describe('toast', () => {
     action.blur();
     vi.advanceTimersByTime(1000 + 300);
     expect(el.isConnected).toBe(false);
+  });
+
+  it('shows a long two-sentence message as a title and a muted sub-line', () => {
+    const { el } = toast(
+      'Loaded 147 channels from “Dr. Who TV”. 1 channel uses a protocol browsers can’t play (rtmp://).',
+    );
+    expect(el.querySelector('.toast-message').textContent).toBe('Loaded 147 channels from “Dr. Who TV”');
+    expect(el.querySelector('.toast-detail').textContent).toBe(
+      '1 channel uses a protocol browsers can’t play (rtmp://).',
+    );
+    expect(el.querySelector('.toast-text').classList.contains('has-detail')).toBe(true);
+  });
+
+  it('keeps an explicit detail and leaves short messages whole', () => {
+    const { el } = toast('Relay code copied. Paste it.', { detail: 'Replace everything.' });
+    expect(el.querySelector('.toast-message').textContent).toBe('Relay code copied. Paste it.');
+    expect(el.querySelector('.toast-detail').textContent).toBe('Replace everything.');
+    expect(splitMessage('Something went wrong. Please try again.')).toEqual([
+      'Something went wrong. Please try again.',
+      '',
+    ]);
+  });
+
+  it('splits only at a sentence break outside quotes and brackets', () => {
+    const manifest = 'This file is a single HLS stream manifest, not a channel list. Add it by its URL.';
+    expect(splitMessage(manifest)).toEqual([
+      'This file is a single HLS stream manifest, not a channel list',
+      'Add it by its URL.',
+    ]);
+    const bracketed = 'Playlists from a file (e.g. Downloads. Or Desktop) can’t be refreshed without it';
+    expect(splitMessage(bracketed)).toEqual([bracketed, '']);
+    const lowercase = 'Couldn’t reach the server, e.g. because you are offline. or it moved elsewhere';
+    expect(splitMessage(lowercase)).toEqual([lowercase, '']);
+    const question = 'Is the link still valid? Check it and try adding the playlist again later';
+    expect(splitMessage(question)).toEqual([
+      'Is the link still valid?',
+      'Check it and try adding the playlist again later',
+    ]);
   });
 });

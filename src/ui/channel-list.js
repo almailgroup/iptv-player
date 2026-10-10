@@ -17,11 +17,17 @@ import {
   selectVisibleChannels,
 } from '../app/selectors.js';
 import { icon, setIcon } from './icons.js';
+import { fitLogo, resetLogo } from './logo-art.js';
 import { openMenu } from './popover.js';
 import { createVirtualList } from './virtual-list.js';
 import { openAddPlaylistDialog, openPlaylistManager } from './dialogs.js';
 
-const ROW_HEIGHT = 56;
+/** Fixed row slot in px: the CSS draws rows with var(--row-h) (tokens.css); keep the two equal. */
+const ROW_HEIGHT = 64;
+/** Height of the list's bottom fade (--cl-fade in channels.css): rows scrolled into view stay above it. */
+const LIST_FADE = 32;
+/** Height of its top fade, shown once the list is scrolled (--cl-fade-top): rows scrolled into view stay below. */
+const LIST_TOP_FADE = 16;
 const OVERSCAN = 8;
 const SEARCH_DEBOUNCE_MS = 60;
 const ANNOUNCE_DELAY_MS = 600;
@@ -70,6 +76,55 @@ const failedLogos = new Set();
 function rememberFailedLogo(url) {
   if (failedLogos.size >= MAX_FAILED_LOGOS) failedLogos.clear();
   failedLogos.add(url);
+}
+
+const WHITESPACE = /\s/;
+/**
+ * Search match positions with the whitespace between two matched characters filled in, so a multi-word
+ * match ("Pinewood Public Access") is one highlight pill instead of a chip per word. Returns `indices`
+ * itself when there is no such gap.
+ */
+function bridgeSpaces(text, indices) {
+  const n = text.length;
+  const marked = new Uint8Array(n);
+  for (const i of indices) if (Number.isInteger(i) && i >= 0 && i < n) marked[i] = 1;
+  let out = null;
+  let last = -1;
+  for (let i = 0; i < n; i++) {
+    if (!marked[i]) continue;
+    if (last >= 0 && i - last > 1) {
+      let j = last + 1;
+      while (j < i && WHITESPACE.test(text[j])) j++;
+      if (j === i) {
+        out ??= Array.from(indices);
+        for (let k = last + 1; k < i; k++) out.push(k);
+      }
+    }
+    last = i;
+  }
+  return out || indices;
+}
+
+/**
+ * channel -> its initials avatar ({ hue, text }), computed once per channel object: rows are recycled on
+ * every scroll frame, and the name hash + initials regex would otherwise run again each time.
+ */
+const avatarArt = new WeakMap();
+function avatarArtOf(channel) {
+  let art = avatarArt.get(channel);
+  if (!art) {
+    const name = String(channel.name || '');
+    art = { hue: String(hueFromString(name)), text: initials(name) };
+    avatarArt.set(channel, art);
+  }
+  return art;
+}
+
+/** A flag pill's colour family: how serious the reason is ("Local" is the local-network http:// case). */
+function flagTone(flag) {
+  if (flag.kind === 'failed') return 'danger';
+  if (flag.kind === 'insecure') return flag.label === 'Local' ? 'info' : 'warning';
+  return flag.kind; // 'unsupported' | 'drm'
 }
 
 const plural = (n, one, many) => `${formatCount(n)} ${n === 1 ? one : many}`;
@@ -133,7 +188,7 @@ export function createChannelList({ store, actions }) {
     'button',
     {
       type: 'button',
-      class: 'icon-btn cl-menu-btn',
+      class: 'icon-btn icon-btn-filled cl-menu-btn',
       'aria-label': 'Open library',
       title: 'Library',
       'aria-controls': 'sidebar',
@@ -144,12 +199,13 @@ export function createChannelList({ store, actions }) {
   );
   const titleEl = h('h2', { class: 'cl-title truncate', id: 'cl-title' });
   const countEl = h('p', { class: 'cl-count truncate' });
+  let countKey = '';
 
   const exportBtn = h(
     'button',
     {
       type: 'button',
-      class: 'icon-btn cl-action',
+      class: 'icon-btn icon-btn-filled cl-action',
       'aria-label': 'Export favorites as M3U',
       title: 'Export favorites (.m3u)',
       hidden: true,
@@ -161,7 +217,7 @@ export function createChannelList({ store, actions }) {
     'button',
     {
       type: 'button',
-      class: 'icon-btn cl-action',
+      class: 'icon-btn icon-btn-filled cl-action',
       'aria-label': 'Clear watch history',
       title: 'Clear recently watched',
       hidden: true,
@@ -178,15 +234,15 @@ export function createChannelList({ store, actions }) {
     'button',
     {
       type: 'button',
-      class: 'icon-btn cl-sort-btn',
+      class: 'icon-btn icon-btn-filled cl-sort-btn',
       'aria-label': 'Sort and filter channels',
       'aria-haspopup': 'menu',
       'aria-expanded': 'false',
       onClick: openSortMenu,
     },
-    icon('sort'),
+    icon('sort-lines'),
   );
-  sortBtn.dataset.icon = 'sort';
+  sortBtn.dataset.icon = 'sort-lines';
 
   const input = h('input', {
     type: 'search',
@@ -216,7 +272,7 @@ export function createChannelList({ store, actions }) {
         input.focus({ preventScroll: true });
       },
     },
-    icon('close', { size: 16 }),
+    icon('close', { size: 15 }),
   );
   const kbdHint = h('kbd', {
     class: 'kbd cl-kbd',
@@ -224,10 +280,11 @@ export function createChannelList({ store, actions }) {
     title: 'Press / to search',
     text: '/',
   });
+  // The 44px search pill (base.css .input-search); the placeholder names the category's size.
   const searchGroup = h(
     'div',
-    { class: 'input-group cl-search', role: 'search' },
-    icon('search', { size: 16 }),
+    { class: 'input-group input-search cl-search', role: 'search' },
+    icon('search', { size: 19 }),
     input,
     h('div', { class: 'input-trailing' }, clearBtn, kbdHint),
   );
@@ -241,7 +298,7 @@ export function createChannelList({ store, actions }) {
       'button',
       { type: 'button', class: 'cl-link', onClick: searchAllChannels },
       'Search all channels',
-      icon('arrow-right', { size: 14 }),
+      icon('chevron-right', { size: 15 }),
     ),
   );
   const live = h('div', {
@@ -273,6 +330,8 @@ export function createChannelList({ store, actions }) {
   const vl = createVirtualList({
     rowHeight: ROW_HEIGHT,
     overscan: OVERSCAN,
+    endInset: LIST_FADE,
+    startInset: LIST_TOP_FADE,
     renderRow,
     getKey: (item) => item.channel.id,
     onRangeChange: syncActiveDescendant,
@@ -310,12 +369,13 @@ export function createChannelList({ store, actions }) {
       },
       icon('star', { size: 16 }),
     );
+    // The visible tile (hover / current / cursor) is the row's ::before, so state changes never reflow.
     const row = h(
       'div',
       { class: 'cl-row', role: 'option', 'aria-selected': 'false' },
       avatar,
       h('span', { class: 'cl-text' }, name, meta),
-      h('span', { class: 'cl-eq', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')),
+      h('span', { class: 'cl-eq', 'aria-hidden': 'true' }, h('i'), h('i'), h('i'), h('i')),
       star,
     );
     rowRefs.set(row, {
@@ -360,8 +420,9 @@ export function createChannelList({ store, actions }) {
 
     const channelChanged = r.channel !== channel;
     if (channelChanged || r.indices !== indices) {
-      if (indices && indices.length) replaceChildren(r.name, highlight(channel.name, indices));
-      else r.name.textContent = channel.name;
+      if (indices && indices.length) {
+        replaceChildren(r.name, highlight(channel.name, bridgeSpaces(String(channel.name ?? ''), indices)));
+      } else r.name.textContent = channel.name;
       r.indices = indices;
     }
     if (channelChanged) r.name.title = channel.name;
@@ -437,26 +498,35 @@ export function createChannelList({ store, actions }) {
     return channel.index === -1 && !!channel.playlistId && channel.playlistId !== activePlaylistId;
   }
 
+  /**
+   * "[pill] [+1] Group · #chno". Pills lead the line so a long group name can't truncate them away, and
+   * there is at most one: the playability flag, else the "Other playlist" tag; when a row has both, the tag
+   * folds into a "+1" chip whose tooltip names it (the row's label says both either way).
+   */
   function renderMeta(metaEl, channel, other, flag) {
     clear(metaEl);
-    // The flag leads the line so a long group name can't truncate it away.
-    if (flag) {
-      metaEl.append(
-        h('span', { class: 'cl-flag', dataset: { kind: flag.kind }, text: flag.label, title: flagTitle(flag) }),
-      );
-    }
-    const text = [channel.group, channel.chno != null ? `#${channel.chno}` : ''].filter(Boolean).join(' · ');
-    if (text) metaEl.append(text);
+    let otherTitle = '';
     if (other) {
       const source = store.get().playlists.find((p) => p.id === channel.playlistId);
+      otherTitle = source ? `From “${source.name}”` : 'From another playlist';
+    }
+    if (flag) {
       metaEl.append(
         h('span', {
-          class: 'cl-tag',
-          text: 'Other playlist',
-          title: source ? `From “${source.name}”` : 'From another playlist',
+          class: 'cl-flag',
+          dataset: { kind: flag.kind, tone: flagTone(flag) },
+          text: flag.label,
+          title: flagTitle(flag),
         }),
       );
+      if (other) metaEl.append(h('span', { class: 'cl-more', text: '+1', title: `Other playlist · ${otherTitle}` }));
+    } else if (other) {
+      metaEl.append(h('span', { class: 'cl-tag', text: 'Other playlist', title: otherTitle }));
     }
+    const chno = channel.chno != null ? `#${channel.chno}` : '';
+    if (channel.group) metaEl.append(channel.group);
+    if (channel.group && chno) metaEl.append(h('span', { class: 'cl-sep', text: ' · ' }));
+    if (chno) metaEl.append(chno);
   }
 
   /**
@@ -472,37 +542,48 @@ export function createChannelList({ store, actions }) {
     // requests for rows that are long gone would otherwise queue ahead of the logos now on screen.
     if (previous && !previous.complete) previous.removeAttribute('src');
     clear(avatar);
+    resetLogo(avatar);
     if (!logo || failedLogos.has(logo)) {
-      showInitials(r, channel.name);
+      showInitials(r, channel);
       return;
     }
+    // A neutral tile while it loads; .is-loaded puts the logo on its plate (base.css .avatar), which
+    // fitLogo() then fits to the logo: wide wordmarks, pale logos (dark plate), app icons (edge to edge).
     avatar.className = 'avatar cl-avatar';
-    avatar.style.removeProperty('--hue');
     const img = h('img', { alt: '', loading: 'lazy', decoding: 'async', referrerpolicy: 'no-referrer' });
     img.draggable = false;
     img.addEventListener('load', () => {
-      if (r.img === img) avatar.classList.add('is-loaded');
+      if (r.img !== img) return;
+      fitLogo(avatar, img, logo);
+      avatar.classList.add('is-loaded');
     });
     img.addEventListener('error', () => {
       if (r.img !== img) return; // replaced (and possibly cancelled) — not a broken logo
       rememberFailedLogo(logo);
-      showInitials(r, channel.name);
+      showInitials(r, channel);
     });
     r.img = img;
     img.src = logo;
     avatar.append(img);
     // Already decoded (memory cache): show immediately, without the fade-in.
-    if (img.complete && img.naturalWidth > 0) avatar.classList.add('is-loaded');
+    if (img.complete && img.naturalWidth > 0) {
+      fitLogo(avatar, img, logo);
+      avatar.classList.add('is-loaded');
+    }
   }
 
-  function showInitials(r, name) {
+  /** Initials art tinted by the channel's hashed hue (--h, read by .avatar-fallback). */
+  function showInitials(r, channel) {
     const { avatar } = r;
+    const art = avatarArtOf(channel);
     r.img = null;
+    resetLogo(avatar);
     avatar.className = 'avatar avatar-fallback cl-avatar';
-    avatar.style.setProperty('--hue', String(hueFromString(name)));
-    avatar.textContent = initials(name);
+    avatar.style.setProperty('--h', art.hue);
+    avatar.textContent = art.text;
   }
 
+  /** Placeholder rows with the real row's anatomy (64px slot, 44px avatar, name + meta lines). */
   function buildSkeleton() {
     const rows = SKELETON_WIDTHS.slice(0, SKELETON_ROWS).map(([a, b]) =>
       h(
@@ -782,14 +863,14 @@ export function createChannelList({ store, actions }) {
           : []),
         {
           label: 'Hide unplayable channels',
-          icon: 'filter',
+          icon: 'eye-off',
           checked: isHiding(state),
           onSelect: () => actions.updateSettings({ hideUnplayable: !isHiding(store.get()) }),
         },
       ],
     });
     // openMenu renders `checked` items as radios; this one is an on/off toggle (the only item outside the
-    // "Sort by" group).
+    // "Sort by" group). channels.css draws the group as a segmented control and the toggle as a switch.
     handle?.el.querySelector('.menu > .menu-item')?.setAttribute('role', 'menuitemcheckbox');
   }
 
@@ -825,7 +906,7 @@ export function createChannelList({ store, actions }) {
   const button = (label, variant, onClick, iconName) =>
     h(
       'button',
-      { type: 'button', class: ['btn', 'btn-sm', `btn-${variant}`], onClick },
+      { type: 'button', class: ['btn', `btn-${variant}`], onClick },
       iconName ? icon(iconName, { size: 16 }) : null,
       label,
     );
@@ -835,15 +916,20 @@ export function createChannelList({ store, actions }) {
     const openManager = () => openPlaylistManager({ store, actions });
     switch (mode) {
       case 'no-playlist':
-        return emptyState(
-          'tv',
-          'No playlist loaded',
-          'Add an M3U playlist by link or file to start watching.',
-          [
+        // In the app the welcome hero holds these actions (#app[data-library='empty']): channels.css then
+        // swaps this block for the one-line hint, so the two buttons don't show twice.
+        return [
+          emptyState('tv', 'No playlist loaded', 'Add an M3U playlist by link or file to start watching.', [
             button('Add playlist', 'primary', openAdd, 'plus'),
             button('Try demo channels', 'secondary', () => ignoreRejection(actions.addDemoPlaylist())),
-          ],
-        );
+          ]),
+          h(
+            'p',
+            { class: 'cl-empty-hint' },
+            h('span', { class: 'cl-empty-hint-icon', 'aria-hidden': 'true' }, icon('tv', { size: 18 })),
+            'Your channels will appear here',
+          ),
+        ];
       case 'no-active':
         return emptyState(
           'layers',
@@ -881,13 +967,16 @@ export function createChannelList({ store, actions }) {
         const hiddenNote = `${formatCount(v.hidden)}\u00a0${
           v.hidden === 1 ? 'unplayable channel is' : 'unplayable channels are'
         } hidden.`;
+        const all = state.channels.length;
         return emptyState(
           'search',
           `No matches for “${ellipsize(v.query, 48)}”`,
           hidden ? `${text} ${hiddenNote}` : text,
           [
-            inSubCategory ? button('Search all channels', 'primary', searchAllChannels) : null,
-            button('Clear search', 'secondary', () => {
+            inSubCategory
+              ? button(all > 1 ? `Search all ${formatCount(all)} channels` : 'Search all channels', 'primary', searchAllChannels)
+              : null,
+            button('Clear', 'secondary', () => {
               clearSearch();
               input.focus({ preventScroll: true });
             }),
@@ -932,6 +1021,7 @@ export function createChannelList({ store, actions }) {
     skeletonEl.hidden = !isLoading;
     emptyEl.hidden = isList || isLoading;
     body.setAttribute('aria-busy', String(isLoading));
+    if (el.dataset.mode !== mode) el.dataset.mode = mode; // channels.css styles the no-playlist panel
 
     let key = mode;
     if (mode === 'no-results') key += `|${v.query}|${state.category}|${v.hidden}`;
@@ -952,21 +1042,30 @@ export function createChannelList({ store, actions }) {
       list.setAttribute('aria-label', label);
     }
 
-    // Counts exclude hidden (unplayable) channels, which get their own "· N hidden".
+    // Counts exclude hidden (unplayable) channels, which get their own "· N hidden". The leading number
+    // is emphasised: "<b>12</b> of 147", "<b>147</b> channels".
     const hidden = v.hidden > 0 ? v.hidden : 0;
     const shown = v.total - hidden;
-    let count;
-    if (mode === 'loading') count = state.busy?.message || 'Loading channels…';
-    else if (mode === 'no-playlist' || mode === 'no-active' || mode === 'error') count = '';
-    else {
-      count = v.query
-        ? `${formatCount(v.items.length)} of ${formatCount(shown)}`
-        : plural(shown, 'channel', 'channels');
-      if (hidden) count += ` · ${formatCount(hidden)} hidden`;
+    let lead = '';
+    let rest = '';
+    if (mode === 'loading') rest = state.busy?.message || 'Loading channels…';
+    else if (mode !== 'no-playlist' && mode !== 'no-active' && mode !== 'error') {
+      const n = v.query ? v.items.length : shown;
+      lead = formatCount(n);
+      rest = v.query ? ` of ${formatCount(shown)}` : ` ${n === 1 ? 'channel' : 'channels'}`;
+      if (hidden) rest += ` · ${formatCount(hidden)} hidden`;
     }
-    if (countEl.textContent !== count) countEl.textContent = count;
-    const countTitle = hidden && count ? `${plural(hidden, 'channel', 'channels')} that can’t play here` : '';
+    const key = `${lead}|${rest}`;
+    if (key !== countKey) {
+      countKey = key;
+      replaceChildren(countEl, lead ? h('b', { text: lead }) : null, rest || null);
+    }
+    const countTitle = hidden && (lead || rest) ? `${plural(hidden, 'channel', 'channels')} that can’t play here` : '';
     if (countEl.title !== countTitle) countEl.title = countTitle;
+
+    // "Search 147 channels" (what's searchable here; the field's accessible name stays "Search channels").
+    const placeholder = mode === 'list' && shown > 1 ? `Search ${formatCount(shown)} channels` : 'Search channels';
+    if (input.placeholder !== placeholder) input.placeholder = placeholder;
 
     const cat = state.category;
     exportBtn.hidden = cat !== CATEGORY.favorites;
@@ -977,7 +1076,7 @@ export function createChannelList({ store, actions }) {
     const sortable = cat !== CATEGORY.recent;
     const sorted = sortable && state.sort === 'name';
     const hiding = isHiding(state);
-    const menuIcon = sortable ? 'sort' : 'filter';
+    const menuIcon = sortable ? 'sort-lines' : 'filter';
     if (sortBtn.dataset.icon !== menuIcon) {
       sortBtn.dataset.icon = menuIcon;
       setIcon(sortBtn, menuIcon);

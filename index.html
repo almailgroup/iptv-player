@@ -9,7 +9,7 @@
       content="A fast, minimalist web IPTV player. Load M3U/M3U8 playlists by URL or file, browse by category, search, and pin favorites."
     />
     <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#0a0c10" />
+    <meta name="theme-color" content="#06070c" />
     <meta name="referrer" content="strict-origin-when-cross-origin" />
     <meta
       http-equiv="Content-Security-Policy"
@@ -17,13 +17,22 @@
     />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="manifest" href="/manifest.webmanifest" />
+    <link
+      rel="preload"
+      href="/src/assets/fonts/figtree-latin-wght-normal.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
     <script src="/theme-init.js"></script>
   </head>
   <body>
     <noscript>
-      <p style="padding: 24px; font-family: system-ui, sans-serif">IPTV Player needs JavaScript enabled to run.</p>
+      <p class="noscript">IPTV Player needs JavaScript enabled to run.</p>
     </noscript>
     <div id="app" class="app" data-ready="false">
+      <!-- Ambient background: accent aurora + grain (layout.css); the player adds the video wash. -->
+      <div class="app-ambient" aria-hidden="true"></div>
       <aside id="sidebar" class="sidebar" aria-label="Library"></aside>
       <div class="sidebar-backdrop" data-action="close-sidebar" hidden></div>
       <section id="channels" class="channels" aria-label="Channels"></section>

@@ -205,7 +205,7 @@ export function createThemePicker({ store, actions }) {
       h(
         'div',
         {
-          class: 'segmented th-modes',
+          class: 'segmented segmented-block th-modes',
           role: 'radiogroup',
           'aria-labelledby': modeLabelId,
           onKeydown: (e) => handleRadioKeys(e, modes, (i) => chooseMode(MODES[i])),

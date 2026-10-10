@@ -6,7 +6,10 @@
 // range its element is handed back to `renderRow` for the next index that needs one. Scroll and resize
 // updates are batched into one requestAnimationFrame. Very long lists whose real height would exceed what
 // browsers can lay out (~17.9M px in Firefox) are transparently "compressed": the sizer is capped and the
-// scroll offset is mapped onto the virtual offset, so 300k+ rows still work.
+// scroll offset is mapped onto the virtual offset, so 300k+ rows still work. An optional `endInset` reserves
+// room under the last row for a bottom fade (mask) on the viewport: rows scrolled into view stay clear of it;
+// `startInset` does the same for a top fade, which the CSS shows only once the list is scrolled
+// (`data-scrolled` on the viewport while scrollTop > 0).
 
 import { h } from '../lib/dom.js';
 import { clamp } from '../lib/utils.js';
@@ -39,7 +42,13 @@ const caf = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : 
  *   getKey?: (item: T, index: number) => string,
  *   onRangeChange?: (range: { start: number, end: number, visibleStart: number, visibleEnd: number }) => void,
  *   className?: string,
+ *   endInset?: number,
+ *   startInset?: number,
  * }} options
+ *   `endInset` (px): the bottom of the viewport that is covered (e.g. faded out). The list gets that much
+ *   extra scroll room after its last row, and scrollToIndex() keeps rows above it.
+ *   `startInset` (px): the same for the top of the viewport, covered only once the list is scrolled (the
+ *   first row starts clear of it at scrollTop 0): scrollToIndex() keeps rows below it.
  * @returns {{
  *   el: HTMLElement,
  *   setItems: (items: T[], opts?: { keepScroll?: boolean }) => void,
@@ -56,13 +65,24 @@ const caf = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : 
  *   that is at least partially inside the viewport (-1 when empty).
  */
 export function createVirtualList(options) {
-  const { rowHeight, overscan = 6, renderRow, getKey, onRangeChange, className } = options || {};
+  const {
+    rowHeight,
+    overscan = 6,
+    renderRow,
+    getKey,
+    onRangeChange,
+    className,
+    endInset = 0,
+    startInset = 0,
+  } = options || {};
   if (!(Number.isFinite(rowHeight) && rowHeight > 0)) {
     throw new TypeError('createVirtualList: rowHeight must be a positive number');
   }
   if (typeof renderRow !== 'function') throw new TypeError('createVirtualList: renderRow must be a function');
   const keyOf = typeof getKey === 'function' ? getKey : (_item, index) => String(index);
   const over = Math.max(0, Math.floor(overscan));
+  const inset = Number.isFinite(endInset) && endInset > 0 ? endInset : 0;
+  const topInset = Number.isFinite(startInset) && startInset > 0 ? startInset : 0;
 
   const sizer = h('div', {
     class: 'vl-sizer',
@@ -96,6 +116,7 @@ export function createVirtualList(options) {
   /** scroll request made while the viewport had no size (hidden); applied on the next resize */
   let pendingScroll = null;
   let range = { start: 0, end: 0, visibleStart: 0, visibleEnd: -1 };
+  let scrolled = false; // mirrored as data-scrolled (the CSS top fade)
 
   function viewportHeight() {
     if (viewportH > 0) return viewportH;
@@ -105,13 +126,19 @@ export function createVirtualList(options) {
     return (typeof window !== 'undefined' && window.innerHeight) || 800;
   }
 
+  /**
+   * total = height of all rows; full = the virtual scroll height (rows + endInset); sizerH = the real one
+   * (capped); `avail` = the part of the viewport between the start and end insets.
+   */
   function metrics() {
     const total = items.length * rowHeight;
+    const full = total > 0 ? total + inset : 0;
     const vh = viewportHeight();
-    const sizerH = Math.min(total, MAX_SCROLL_HEIGHT);
-    const scaled = total > sizerH && sizerH > vh;
-    const ratio = scaled ? (total - vh) / (sizerH - vh) : 1;
-    return { total, vh, sizerH, scaled, ratio };
+    const sizerH = Math.min(full, MAX_SCROLL_HEIGHT);
+    const scaled = full > sizerH && sizerH > vh;
+    const ratio = scaled ? (full - vh) / (sizerH - vh) : 1;
+    const avail = Math.max(rowHeight, vh - inset - topInset);
+    return { total, full, vh, avail, sizerH, scaled, ratio };
   }
 
   function prepare(row) {
@@ -153,6 +180,11 @@ export function createVirtualList(options) {
     const m = metrics();
     const scrollTop = el.scrollTop;
     const virtualTop = m.scaled ? scrollTop * m.ratio : scrollTop;
+    if (scrolled !== scrollTop > 0) {
+      scrolled = scrollTop > 0;
+      if (scrolled) el.dataset.scrolled = '';
+      else delete el.dataset.scrolled;
+    }
     // In compressed mode rows are placed relative to the current scroll offset.
     const offset = m.scaled ? scrollTop - virtualTop : 0;
 
@@ -283,17 +315,18 @@ export function createVirtualList(options) {
     const m = metrics();
     const scrollTop = el.scrollTop;
     const virtualTop = m.scaled ? scrollTop * m.ratio : scrollTop;
-    const top = i * rowHeight;
+    // Offsets of the clear window, [virtualTop + topInset, virtualTop + topInset + avail], from the row.
+    const top = i * rowHeight - topInset;
     const bottom = top + rowHeight;
     let target = null;
     if (align === 'start') target = top;
-    else if (align === 'end') target = bottom - m.vh;
-    else if (align === 'center') target = top - (m.vh - rowHeight) / 2;
+    else if (align === 'end') target = bottom - m.avail;
+    else if (align === 'center') target = top - (m.avail - rowHeight) / 2;
     else if (top < virtualTop) target = top;
-    else if (bottom > virtualTop + m.vh) target = bottom - m.vh;
+    else if (bottom > virtualTop + m.avail) target = bottom - m.avail;
 
     if (target !== null) {
-      target = clamp(target, 0, Math.max(0, m.total - m.vh));
+      target = clamp(target, 0, Math.max(0, m.full - m.vh));
       const nextScroll = m.scaled ? target / m.ratio : target;
       if (Math.abs(nextScroll - scrollTop) >= 1) el.scrollTop = nextScroll;
     }
@@ -324,7 +357,7 @@ export function createVirtualList(options) {
 
   /** Number of rows to move for PageUp / PageDown. */
   function pageSize() {
-    return Math.max(1, Math.floor(viewportHeight() / rowHeight) - 1);
+    return Math.max(1, Math.floor(metrics().avail / rowHeight) - 1);
   }
 
   function destroy() {

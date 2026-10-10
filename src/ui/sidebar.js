@@ -1,8 +1,9 @@
 // Library sidebar (mounted into #sidebar): brand, playlist switcher, library navigation, the playlist's
-// groups (sortable, filterable) and a footer with appearance / settings / shortcuts buttons.
+// groups (sortable, filterable; the group list scrolls on its own) and a footer tray with the appearance,
+// settings and shortcuts buttons.
 
 import { h, clear, replaceChildren, on } from '../lib/dom.js';
-import { formatCount } from '../lib/utils.js';
+import { formatCount, hueFromString } from '../lib/utils.js';
 import { APP_NAME, CATEGORY } from '../app/constants.js';
 import { selectActivePlaylist, selectSortedGroups } from '../app/selectors.js';
 import { icon } from './icons.js';
@@ -21,9 +22,9 @@ const FILTER_THRESHOLD = 10;
 const DRAWER_QUERY = '(max-width: 1100px)';
 
 const LIBRARY = [
-  { cat: CATEGORY.all, label: 'All channels', icon: 'list' },
+  { cat: CATEGORY.all, label: 'All channels', icon: 'grid' },
   { cat: CATEGORY.favorites, label: 'Favorites', icon: 'star' },
-  { cat: CATEGORY.recent, label: 'Recently watched', icon: 'clock' },
+  { cat: CATEGORY.recent, label: 'Recently watched', icon: 'history' },
 ];
 
 const channelsLabel = (n) => `${formatCount(n)} ${n === 1 ? 'channel' : 'channels'}`;
@@ -54,7 +55,7 @@ export function createSidebar({ store, actions }) {
   const brand = h(
     'div',
     { class: 'sb-brand' },
-    h('span', { class: 'sb-logo', 'aria-hidden': 'true' }, icon('logo', { size: 18 })),
+    h('span', { class: 'sb-logo', 'aria-hidden': 'true' }, icon('logo', { size: 20 })),
     h('span', { class: 'sb-wordmark', text: APP_NAME }),
     h(
       'button',
@@ -78,7 +79,7 @@ export function createSidebar({ store, actions }) {
     { type: 'button', class: 'sb-switcher', 'aria-expanded': 'false', onClick: onSwitcherClick },
     swIcon,
     h('span', { class: 'sb-switcher-text' }, swName, swMeta),
-    icon('chevron-down', { size: 16, class: 'sb-switcher-chevron' }),
+    icon('chevrons-up-down', { size: 16, class: 'sb-switcher-chevron' }),
   );
   let swIconKind = '';
 
@@ -89,7 +90,7 @@ export function createSidebar({ store, actions }) {
       swIcon,
       kind === 'busy'
         ? h('span', { class: 'spinner spinner-sm' })
-        : icon(kind === 'add' ? 'plus' : 'layers', { size: 16 }),
+        : icon(kind === 'add' ? 'plus' : 'layers', { size: 18 }),
     );
   }
 
@@ -172,13 +173,15 @@ export function createSidebar({ store, actions }) {
   // ---- Library nav ---------------------------------------------------------------------------------
   /** category -> { btn, count, label } for library items */
   const libraryItems = new Map();
-  const libraryList = h('ul', { class: 'sb-nav', role: 'list' });
+  const libraryTitle = h('h2', { class: 'sb-section-title', id: 'sb-library-title', text: 'Library' });
+  const libraryList = h('ul', { class: 'sb-nav', role: 'list', 'aria-labelledby': 'sb-library-title' });
   for (const item of LIBRARY) {
     const count = h('span', { class: 'count sb-count', 'aria-hidden': 'true' });
+    // The icon sits in a 30px disc that turns into the accent gradient when the item is active.
     const btn = h(
       'button',
-      { type: 'button', class: 'sb-item', dataset: { cat: item.cat } },
-      icon(item.icon, { size: 18, class: 'sb-item-icon' }),
+      { type: 'button', class: 'sb-item sb-nav-item', dataset: { cat: item.cat } },
+      h('span', { class: 'sb-item-icon', 'aria-hidden': 'true' }, icon(item.icon, { size: 17 })),
       h('span', { class: 'sb-item-label truncate', text: item.label }),
       count,
     );
@@ -209,12 +212,12 @@ export function createSidebar({ store, actions }) {
       class: 'icon-btn icon-btn-sm sb-sort',
       onClick: () => actions.setGroupSort(store.get().groupSort === 'name' ? 'playlist' : 'name'),
     },
-    icon('sort', { size: 16 }),
+    icon('sort-az', { size: 16 }),
   );
   const filterInput = h('input', {
     type: 'search',
     class: 'input input-sm sb-filter-input',
-    placeholder: 'Filter groups…',
+    placeholder: 'Filter groups',
     autocomplete: 'off',
     'aria-label': 'Filter groups',
     'aria-controls': 'sb-groups',
@@ -239,7 +242,7 @@ export function createSidebar({ store, actions }) {
   const filterWrap = h(
     'div',
     { class: 'input-group sb-filter', hidden: true },
-    icon('filter', { size: 14 }),
+    icon('filter', { size: 15 }),
     filterInput,
     h('div', { class: 'input-trailing' }, filterClear),
   );
@@ -257,6 +260,7 @@ export function createSidebar({ store, actions }) {
     ),
     filterWrap,
   );
+  // The group list is the scroll area (library and head stay put); on short screens the whole nav scrolls.
   const groupList = h('ul', {
     class: 'sb-nav sb-group-list',
     id: 'sb-groups',
@@ -268,6 +272,8 @@ export function createSidebar({ store, actions }) {
 
   /** @type {Array<{ li: HTMLElement, btn: HTMLButtonElement, fold: string, cat: string }>} */
   let groupEntries = [];
+  /** No channels loaded (no playlist yet): the empty group list explains where groups come from. */
+  let noChannels = true;
   /** category -> group button */
   let groupButtons = new Map();
   let renderedGroups = null;
@@ -283,6 +289,7 @@ export function createSidebar({ store, actions }) {
     const frag = document.createDocumentFragment();
     for (const group of groups) {
       const cat = CATEGORY.groupPrefix + group.name;
+      // --h: the group's hashed hue for its dot (the same hash tints channel initials).
       const btn = h(
         'button',
         {
@@ -291,7 +298,9 @@ export function createSidebar({ store, actions }) {
           dataset: { cat },
           tabIndex: -1,
           'aria-label': `${group.name}, ${channelsLabel(group.count)}`,
+          style: { '--h': hueFromString(group.name) },
         },
+        h('span', { class: 'sb-dot', 'aria-hidden': 'true' }),
         h('span', { class: 'sb-item-label truncate', title: group.name, text: group.name }),
         h('span', { class: 'count sb-count', 'aria-hidden': 'true', text: formatCount(group.count) }),
       );
@@ -323,7 +332,8 @@ export function createSidebar({ store, actions }) {
     }
     filterClear.hidden = !filterInput.value;
     if (!groupEntries.length) {
-      groupsEmpty.textContent = 'No groups';
+      groupsEmpty.textContent = noChannels ? 'Groups from your playlist will appear here.' : 'No groups';
+      groupsEmpty.classList.toggle('is-placeholder', noChannels);
       groupsEmpty.hidden = false;
     } else if (!shown) {
       groupsEmpty.textContent = `No groups match “${raw.length > 32 ? `${raw.slice(0, 31)}…` : raw}”`;
@@ -376,14 +386,31 @@ export function createSidebar({ store, actions }) {
       revealInScroller(activeBtn);
   }
 
-  /** Scroll `btn` into view inside the sidebar scroller only (never the page), clear of the sticky head. */
+  /** The element that scrolls `btn`: the group list, or the whole nav when it scrolls (short screens). */
+  function scrollerOf(btn) {
+    if (groupList.contains(btn) && groupList.scrollHeight > groupList.clientHeight + 1) {
+      const { overflowY } = getComputedStyle(groupList);
+      if (overflowY === 'auto' || overflowY === 'scroll') return groupList;
+    }
+    return scroller;
+  }
+
+  /**
+   * Scroll `btn` into view inside its scroller only (never the page), clear of the scroller's
+   * scroll-padding (sidebar.css keeps it equal to the edge fades).
+   */
   function revealInScroller(btn) {
-    if (!scroller.clientHeight) return;
+    const sc = scrollerOf(btn);
+    if (!sc.clientHeight) return;
+    const cs = getComputedStyle(sc);
+    const padTop = parseFloat(cs.scrollPaddingTop) || 0;
+    const padBottom = parseFloat(cs.scrollPaddingBottom) || 0;
     const box = btn.getBoundingClientRect();
-    const view = scroller.getBoundingClientRect();
-    const minTop = Math.max(view.top, groupsHead.getBoundingClientRect().bottom);
-    if (box.top < minTop) scroller.scrollTop -= minTop - box.top + 4;
-    else if (box.bottom > view.bottom) scroller.scrollTop += box.bottom - view.bottom + 4;
+    const view = sc.getBoundingClientRect();
+    const minTop = view.top + padTop;
+    const maxBottom = view.bottom - padBottom;
+    if (box.top < minTop) sc.scrollTop -= minTop - box.top;
+    else if (box.bottom > maxBottom) sc.scrollTop += box.bottom - maxBottom;
   }
 
   function selectCategory(category) {
@@ -395,9 +422,20 @@ export function createSidebar({ store, actions }) {
   const scroller = h(
     'nav',
     { class: 'sb-scroll', 'aria-label': 'Categories' },
-    h('section', { class: 'sb-section sb-library' }, libraryList),
+    h('section', { class: 'sb-section sb-library' }, libraryTitle, libraryList),
     groupsSection,
   );
+
+  // Once a scroller has moved, sidebar.css fades its top edge too (data-scrolled), so the first visible
+  // group isn't cut hard under the filter field.
+  const markScrolled = (el) => {
+    const scrolled = el.scrollTop > 0;
+    if (scrolled === 'scrolled' in el.dataset) return;
+    if (scrolled) el.dataset.scrolled = '';
+    else delete el.dataset.scrolled;
+  };
+  listen(groupList, 'scroll', () => markScrolled(groupList), { passive: true });
+  listen(scroller, 'scroll', () => markScrolled(scroller), { passive: true });
 
   listen(scroller, 'click', (e) => {
     const btn = e.target instanceof Element ? e.target.closest('.sb-item') : null;
@@ -470,10 +508,19 @@ export function createSidebar({ store, actions }) {
   });
 
   // ---- Footer --------------------------------------------------------------------------------------
+  // A pill tray: the appearance button (palette icon, "Theme" and a dot in the current accent; its
+  // accessible name stays the switcher's "Theme"), then settings and shortcuts.
+  const themeBtn = createThemeSwitcher({ store, actions });
+  themeBtn.classList.add('sb-theme');
+  themeBtn.append(
+    h('span', { class: 'sb-theme-label', text: 'Theme' }),
+    h('span', { class: 'sb-theme-dot', 'aria-hidden': 'true' }),
+  );
   const footer = h(
     'div',
     { class: 'sb-footer' },
-    createThemeSwitcher({ store, actions }),
+    themeBtn,
+    h('span', { class: 'sb-spacer' }),
     h(
       'button',
       {
@@ -530,6 +577,10 @@ export function createSidebar({ store, actions }) {
       state.recents !== prev.recents
     ) {
       renderCounts(state);
+    }
+    if (noChannels !== !state.channels.length) {
+      noChannels = !state.channels.length;
+      applyFilter();
     }
     let groupsChanged = false;
     if (!prev || state.groups !== prev.groups || state.groupSort !== prev.groupSort) {

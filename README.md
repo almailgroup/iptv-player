@@ -30,6 +30,9 @@ for **GitHub Pages**, with a small stream relay for the channels that browsers b
   with nothing to set up. You can switch it off or use your own relay instead.
 - **Playability labels:** channels that can't play here (unsupported formats, DRM, insecure streams without
   a relay, or channels that just failed) are flagged in the list, and the sort menu can hide them.
+- **Design:** rounded glass panels over a soft colour field, with a floating pill control bar, a now-playing
+  card and an Up next / Recently watched / Favorites shelf under the player. The background can pick up the
+  colours of the playing video (**Settings → Ambient colour from video**).
 - **Themes:** dark by default, with a light mode and 7 accent palettes: Deep Azure, Emerald Green,
   Neon Cyberpunk, Warm Amber, Monochrome Slate, Crimson Rose and Royal Violet.
 - **Persistence:** playlists (gzip-compressed), favorites, recent channels, theme, settings, volume and the
@@ -162,6 +165,7 @@ src/lib/                 M3U parser, fuzzy search, storage, playlist loader, DOM
 src/player/              Playback engine (hls.js / native / mpegts.js), stream type detection
 src/ui/                  Player view, sidebar, channel list, virtual list, dialogs, theme, popovers, toasts
 src/styles/              Design tokens + themes and component styles
+src/assets/fonts/        Self-hosted Figtree variable font (SIL Open Font License)
 proxy/                   Stream relay for http:// and CORS-blocked streams (Deno Deploy, Workers, Node)
 deno.json                Deno Deploy config: runs the relay (proxy/deno.js), no build step
 tests/                   Vitest unit tests

@@ -1,10 +1,12 @@
 // Channel list UI: the now-playing equalizer follows state.playbackState (repainting only the current row),
-// recycled rows cancel their stale logo downloads, and channels that can't play here are flagged (or hidden,
-// with the sort menu's "Hide unplayable channels").
+// recycled rows cancel their stale logo downloads, channels that can't play here are flagged (or hidden,
+// with the sort menu's "Hide unplayable channels"), the row / header anatomy (one meta pill + "+1",
+// hashed-hue initials, emphasised counts), the no-playlist hint and recycled logo plates.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createStore } from '../src/app/store.js';
 import { DEFAULT_SETTINGS } from '../src/app/constants.js';
+import { hueFromString } from '../src/lib/utils.js';
 import { createChannelList } from '../src/ui/channel-list.js';
 
 function channel(i, extra = {}) {
@@ -261,6 +263,135 @@ describe('playability flags', () => {
     const { store, rowFor } = current;
     store.set({ health: { ch3: { code: 'DRM', title: 'Protected content', at: Date.now() } } });
     expect(flagOf(rowFor('ch3')).dataset.kind).toBe('drm');
+  });
+
+  it('tones each flag by how serious it is (a local-network stream is informational)', () => {
+    window.happyDOM.setURL('https://me.github.io/');
+    current = setup({
+      channels: [...flagged(), channel(5, { name: 'LAN', url: 'http://192.168.1.20/live/index.m3u8' }), channel(6)],
+    });
+    const { store, rowFor } = current;
+    store.set({ health: { ch6: { code: 'HTTP', title: 'Channel not found', at: Date.now() } } });
+    const tones = Object.fromEntries(
+      ['ch1', 'ch3', 'ch4', 'ch5', 'ch6'].map((id) => [flagOf(rowFor(id)).textContent, flagOf(rowFor(id)).dataset.tone]),
+    );
+    expect(tones).toEqual({
+      'Not supported': 'unsupported',
+      DRM: 'drm',
+      HTTP: 'warning',
+      Local: 'info',
+      Unavailable: 'danger',
+    });
+  });
+});
+
+describe('row and header anatomy', () => {
+  const playlists = [
+    { id: 'pl1', name: 'Test', source: { kind: 'url', url: 'https://example.com/p.m3u' } },
+    { id: 'pl2', name: 'Travel list', source: { kind: 'url', url: 'https://example.com/t.m3u' } },
+  ];
+
+  it('shows at most one meta pill: a second reason folds into a "+1" chip', () => {
+    const favorites = [
+      { id: 'r1', name: 'Remote RTMP', url: 'rtmp://example.com/r', group: 'News', playlistId: 'pl2' },
+      { id: 'r2', name: 'Remote HLS', url: 'https://example.com/r.m3u8', group: 'News', playlistId: 'pl2' },
+    ];
+    current = setup({ playlists, favorites, category: 'favorites' });
+    const { rowFor } = current;
+    const meta = (id) => rowFor(id).querySelector('.cl-meta');
+
+    // Can't play here AND from another playlist: the flag leads, the tag becomes "+1" (named in its tooltip).
+    expect([...meta('r1').children].map((el) => el.className)).toEqual(['cl-flag', 'cl-more']);
+    expect(meta('r1').querySelector('.cl-more').title).toBe('Other playlist · From “Travel list”');
+    expect(meta('r1').textContent).toBe('Not supported+1News');
+    expect(rowFor('r1').getAttribute('aria-label')).toContain('from another playlist');
+
+    // Only from another playlist: the tag itself leads the line.
+    expect(meta('r2').firstChild.className).toBe('cl-tag');
+    expect(meta('r2').textContent).toBe('Other playlistNews');
+  });
+
+  it('separates the group and channel number', () => {
+    current = setup({ channels: [channel(0, { chno: 12 })] });
+    const meta = current.rowFor('ch0').querySelector('.cl-meta');
+    expect(meta.textContent).toBe('News · #12');
+    expect(meta.querySelector('.cl-sep').textContent).toBe(' · ');
+  });
+
+  it('tints initials with the channel name’s hashed hue (--h)', () => {
+    current = setup();
+    const avatar = current.rowFor('ch1').querySelector('.cl-avatar');
+    expect(avatar.classList.contains('avatar-fallback')).toBe(true);
+    expect(avatar.style.getPropertyValue('--h')).toBe(String(hueFromString('Channel 1')));
+    expect(avatar.textContent).toBe('C1');
+  });
+
+  it('emphasises the leading count and names the category size in the search placeholder', () => {
+    current = setup({ channels: Array.from({ length: 12 }, (_, i) => channel(i)) });
+    const { store, list } = current;
+    const count = list.el.querySelector('.cl-count');
+    const search = list.el.querySelector('#cl-search');
+    expect(count.querySelector('b').textContent).toBe('12');
+    expect(count.textContent).toBe('12 channels');
+    expect(search.placeholder).toBe('Search 12 channels');
+    expect(search.getAttribute('aria-label')).toBe('Search channels');
+    store.set({ query: 'channel 1' });
+    expect(count.textContent).toMatch(/^\d+ of 12$/);
+    const shown = [...list.el.querySelectorAll('.cl-row')].filter((r) => r.style.display !== 'none');
+    expect(count.querySelector('b').textContent).toBe(String(shown.length));
+  });
+
+  it('highlights a multi-word match as one pill, spaces included', () => {
+    current = setup({ channels: [channel(0, { name: 'Pinewood Public Access' }), channel(1, { name: 'Civic Channel' })] });
+    const { store, rowFor } = current;
+    store.set({ query: 'pinewood public access' });
+    const marks = [...rowFor('ch0').querySelectorAll('.cl-name mark')].map((m) => m.textContent);
+    expect(marks).toEqual(['Pinewood Public Access']);
+    expect(rowFor('ch0').querySelector('.cl-name').textContent).toBe('Pinewood Public Access');
+    // Characters between matches that aren't whitespace stay unmarked.
+    store.set({ query: 'civic chan' });
+    expect([...rowFor('ch1').querySelectorAll('.cl-name mark')].map((m) => m.textContent)).toEqual(['Civic Chan']);
+  });
+
+  it('offers to search all N channels when a search inside a group finds nothing', () => {
+    current = setup({ category: 'group:News' });
+    const { store, list, actions } = current;
+    store.set({ query: 'zzzz' });
+    const buttons = [...list.el.querySelectorAll('.cl-empty button')].map((b) => b.textContent);
+    expect(buttons).toEqual(['Search all 3 channels', 'Clear']);
+    list.el.querySelector('.cl-empty .btn-primary').click();
+    expect(actions.setCategory).toHaveBeenCalledWith('all');
+  });
+});
+
+describe('no playlist yet', () => {
+  it('keeps its actions and adds the one-line hint the app shows beside the welcome hero', () => {
+    current = setup({ playlists: [], activePlaylistId: null, channels: [], groups: [] });
+    const { list } = current;
+    const empty = list.el.querySelector('.cl-empty');
+    expect(empty.hidden).toBe(false);
+    // Without the app shell (#app[data-library='empty']) the full state shows, with both actions …
+    const buttons = [...empty.querySelectorAll('.cl-empty-state button')].map((b) => b.textContent);
+    expect(buttons).toEqual(['Add playlist', 'Try demo channels']);
+    // … channels.css swaps it for this line next to the hero, which holds the same actions.
+    expect(list.el.dataset.mode).toBe('no-playlist');
+    expect(empty.querySelector('.cl-empty-hint').textContent).toBe('Your channels will appear here');
+  });
+});
+
+describe('logo plates', () => {
+  it('clears a recycled avatar’s fitted plate when its row shows initials', () => {
+    current = setup({ channels: [channel(0, { logo: 'https://logos.example/0.png' }), channel(1)] });
+    const { store, rowFor } = current;
+    const avatar = rowFor('ch0').querySelector('.cl-avatar');
+    avatar.dataset.shape = 'wide';
+    avatar.dataset.tone = 'light';
+    avatar.style.setProperty('--logo-box', 'inset(10% 0% 10% 0%)');
+    store.set((s) => ({ settings: { ...s.settings, showLogos: false } }));
+    expect(avatar.classList.contains('avatar-fallback')).toBe(true);
+    expect(avatar.dataset.shape).toBeUndefined();
+    expect(avatar.dataset.tone).toBeUndefined();
+    expect(avatar.style.getPropertyValue('--logo-box')).toBe('');
   });
 });
 

@@ -90,8 +90,13 @@ function setupSidebarDrawer({ store, actions, app, sidebar, backdrop, channels, 
       }
     } else {
       hideBackdrop();
-      if (wasOpen && sidebar.contains(document.activeElement)) {
-        const fallback = channels.querySelector('.cl-menu-btn');
+      // A press on the (unfocusable) scrim has already moved focus to <body>: bring it back too.
+      const active = document.activeElement;
+      if (wasOpen && (!active || active === document.body || sidebar.contains(active))) {
+        // The list header's menu button, or the welcome hero's while the empty list is hidden (tablets).
+        const listBtn = channels.querySelector('.cl-menu-btn');
+        const heroBtn = stage.querySelector('.pv-hero-menu');
+        const fallback = heroBtn && isVisible(heroBtn) && !(listBtn && isVisible(listBtn)) ? heroBtn : listBtn;
         const target = returnFocus?.isConnected && isVisible(returnFocus) ? returnFocus : fallback;
         target?.focus({ preventScroll: true });
       }
@@ -237,6 +242,16 @@ function start() {
     (s) => s.ready,
     (ready) => {
       app.dataset.ready = ready ? 'true' : 'false';
+    },
+    { immediate: true },
+  );
+  // No playlist yet: above phone widths the welcome hero takes the empty channel list's place (layout.css).
+  // While the first playlist downloads, the list stays (its skeleton rows show the progress).
+  store.select(
+    (s) => s.ready && !s.playlists.length && !s.busy,
+    (empty) => {
+      if (empty) app.dataset.library = 'empty';
+      else delete app.dataset.library;
     },
     { immediate: true },
   );

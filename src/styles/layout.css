@@ -1,10 +1,15 @@
 /* ==========================================================================
-   App shell layout (prefix app-) — the #app grid and its three columns.
-   - > 1100px:  sidebar · channels · stage (three independently scrolling columns)
-   - ≤ 1100px:  the sidebar becomes an off-canvas drawer; channels · stage
-   - ≤ 720px:   phones — stage on top (sticky), channel list below filling the rest
-   Column contents (.sb, .cl, .pv-stage-inner) are styled by their own stylesheets; they own their borders
-   and bottom safe-area padding. This file owns sizing, scrolling, the drawer, top/side insets and overlays.
+   App shell layout (prefix app-): the ambient background, the #app grid and its floating glass panels.
+   - ≥ 1101px:  sidebar · channels · stage (sidebar 248 | list 364 | main; 232 | 320 below 1280px)
+   - ≤ 1100px:  the sidebar becomes a floating drawer with a scrim; channels · stage
+   - ≤ 720px:   phones: stage (video + now-playing) on top, channel list panel filling the rest
+   (The drawer query must match DRAWER_QUERY in src/main.js and src/ui/sidebar.js.)
+   This file owns the background, the panels' glass (#sidebar, #channels), the gutters, the drawer, the
+   stage's sizing/scrolling and the global overlays. Panel contents (.sb, .cl) and everything inside
+   #stage (.pv-stage-inner …) are styled by their own stylesheets and must keep a transparent background.
+   Stacking: .app isolates, so .app-ambient and the player's local ambilight can sit at z-index -1 behind
+   the panels. #stage must therefore never become a stacking context or a containing block (no
+   z-index/transform/filter/opacity/contain/container-type on it).
    ========================================================================== */
 
 :root {
@@ -12,27 +17,28 @@
   --app-safe-right: env(safe-area-inset-right, 0px);
   --app-safe-bottom: env(safe-area-inset-bottom, 0px);
   --app-safe-left: env(safe-area-inset-left, 0px);
-  --app-stage-pad: var(--sp-6);
-  --app-stage-max: 1400px;
-  --app-drawer-w: min(86vw, 300px);
+  --app-drawer-inset: 12px;
 }
 
 /* --------------------------------------------------------------------------
    Grid
    -------------------------------------------------------------------------- */
 .app {
+  position: relative;
+  isolation: isolate;
   display: grid;
-  grid-template-columns: var(--sidebar-w) var(--channels-w) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-w) var(--list-w) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   grid-template-areas: 'sidebar channels stage';
+  gap: var(--gap);
   width: 100%;
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
-  padding-left: var(--app-safe-left);
-  padding-right: var(--app-safe-right);
-  background: var(--bg);
-  transition: opacity var(--dur-slow) var(--ease);
+  overflow: clip; /* clips like hidden, but is no scroll container: scrollIntoView can't shift the shell */
+  padding: max(var(--app-pad), var(--app-safe-top)) max(var(--app-pad), var(--app-safe-right))
+    max(var(--app-pad), var(--app-safe-bottom)) max(var(--app-pad), var(--app-safe-left));
+  transition: opacity var(--d-3) var(--ease-out);
 }
 
 /* Hide the half-initialised UI until the controller has restored the session, then fade in. The delayed
@@ -48,27 +54,127 @@
   }
 }
 
+/* --------------------------------------------------------------------------
+   Ambient background (<div class="app-ambient" aria-hidden="true"> in index.html, first child of #app)
+   - The element itself: the accent aurora over --bg. Fixed and static, so it is painted once.
+   - ::before: an extra "nothing playing" bloom; fades out when the player adds .has-video.
+   - Children: the page-wide wash from the video (.app-ambient-wash, a tiny canvas the player stage
+     appends and upscales; no filter blur), shown while the player adds .is-lit.
+   - ::after: film grain (SVG noise tile, low opacity).
+   -------------------------------------------------------------------------- */
+.app-ambient {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  background:
+    radial-gradient(42% 52% at 8% 4%, rgb(var(--accent-rgb) / calc(0.3 * var(--aurora-k))), transparent 70%),
+    radial-gradient(38% 46% at 34% 100%, rgb(var(--aurora-3-rgb) / calc(0.2 * var(--aurora-k))), transparent 72%),
+    radial-gradient(40% 50% at 100% 100%, rgb(var(--accent-2-rgb) / calc(0.16 * var(--aurora-k))), transparent 70%),
+    radial-gradient(30% 40% at 62% 0%, rgb(var(--accent-2-rgb) / calc(0.1 * var(--aurora-k))), transparent 70%),
+    var(--bg);
+}
+.app-ambient::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(40% 55% at 30% 18%, rgb(var(--accent-rgb) / calc(0.16 * var(--aurora-k))), transparent 70%),
+    radial-gradient(36% 50% at 78% 30%, rgb(var(--aurora-3-rgb) / calc(0.18 * var(--aurora-k))), transparent 72%),
+    radial-gradient(44% 50% at 70% 100%, rgb(var(--accent-2-rgb) / calc(0.1 * var(--aurora-k))), transparent 70%),
+    radial-gradient(30% 40% at 0% 100%, rgb(var(--aurora-3-rgb) / calc(0.12 * var(--aurora-k))), transparent 70%);
+  transition: opacity var(--d-4) var(--ease-out);
+}
+.app-ambient.has-video::before {
+  opacity: 0;
+}
+.app-ambient::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: var(--noise-opacity);
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* Light mode: a calmer field: one soft accent glow plus one partner hue, no rainbow fringing. */
+:root[data-mode='light'] .app-ambient {
+  background:
+    radial-gradient(44% 54% at 8% 4%, rgb(var(--accent-rgb) / calc(0.22 * var(--aurora-k))), transparent 70%),
+    radial-gradient(42% 50% at 100% 100%, rgb(var(--accent-2-rgb) / calc(0.14 * var(--aurora-k))), transparent 70%),
+    radial-gradient(32% 40% at 62% 0%, rgb(var(--accent-rgb) / calc(0.08 * var(--aurora-k))), transparent 70%),
+    var(--bg);
+}
+:root[data-mode='light'] .app-ambient::before {
+  background:
+    radial-gradient(40% 55% at 30% 18%, rgb(var(--accent-rgb) / calc(0.12 * var(--aurora-k))), transparent 70%),
+    radial-gradient(36% 50% at 78% 30%, rgb(var(--accent-2-rgb) / calc(0.08 * var(--aurora-k))), transparent 72%);
+}
+
+/* Page-wide wash: an upscaled 32×18 canvas; the bilinear upscale does the blurring. */
+.app-ambient-wash {
+  position: absolute;
+  inset: -6%;
+  width: 112%;
+  height: 112%;
+  max-width: none;
+  opacity: 0;
+  transition: opacity var(--d-4) var(--ease-out);
+}
+.app-ambient.is-lit .app-ambient-wash {
+  opacity: var(--ambi-page-opacity);
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-ambient-wash {
+    display: none; /* static aurora only */
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Docked glass panels: #sidebar and #channels. Translucent fill + sheen, gradient hairline (::after,
+   above the panel's content) and a soft shadow. No backdrop blur (they only sit over soft fields).
+   -------------------------------------------------------------------------- */
 .sidebar,
 .channels {
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding-top: var(--app-safe-top);
+  border-radius: var(--r-panel);
+  background: var(--glass-sheen), var(--glass-bg);
+  box-shadow: var(--glass-shadow);
+}
+
+.sidebar::after,
+.channels::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  padding: 1px;
+  border-radius: inherit;
+  background: var(--glass-edge);
+  pointer-events: none;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
 }
 
 .sidebar {
   grid-area: sidebar;
-  background: var(--bg-elevated);
 }
 
 .channels {
   grid-area: channels;
-  background: var(--bg);
 }
 
-/* Component roots fill their column; they scroll internally. */
+/* Component roots fill their panel; they scroll internally. */
 .sidebar > *,
 .channels > * {
   flex: 1 1 auto;
@@ -76,38 +182,71 @@
   min-height: 0;
 }
 
+/* --------------------------------------------------------------------------
+   Stage (main column). It stacks the player's blocks (video, now-playing card, up-next shelf) with the
+   panel gap. It does not scroll at normal heights, so the video's shadow and ambilight are never clipped:
+   the player stage sizes its blocks to fit (see FOUNDATION.md). Short windows fall back to scrolling.
+   -------------------------------------------------------------------------- */
 .stage {
   grid-area: stage;
   display: flex;
   flex-direction: column;
   align-items: center;
+  gap: var(--gap);
   min-width: 0;
   min-height: 0;
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: calc(var(--app-stage-pad) + var(--app-safe-top)) var(--app-stage-pad)
-    calc(var(--app-stage-pad) + var(--app-safe-bottom));
-  background: var(--bg);
+  overflow: visible;
 }
 
 .stage > * {
   flex: none;
   width: 100%;
-  max-width: var(--app-stage-max);
   min-width: 0;
 }
 
+@media (min-width: 721px) and (max-height: 520px) {
+  .stage {
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+}
+
+/* No playlist yet (#app[data-library='empty'], set by main.js): the empty channel list collapses and the
+   stage (welcome hero) spans the width, beside the sidebar on desktops and alone on tablets, where the hero
+   panel carries the drawer's menu button instead (player.css .pv-hero-menu). Phones keep the list's header
+   under the hero (below). */
+@media (min-width: 1101px) {
+  .app[data-library='empty'] {
+    grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+    grid-template-areas: 'sidebar stage';
+  }
+}
+
+@media (min-width: 721px) {
+  .app[data-library='empty'] > .channels {
+    display: none;
+  }
+}
+
+@media (min-width: 721px) and (max-width: 1100px) {
+  .app[data-library='empty'] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: 'stage';
+  }
+}
+
 /* --------------------------------------------------------------------------
-   Sidebar drawer backdrop (only rendered on ≤ 1100px; main.js toggles [hidden] + .is-leaving)
+   Sidebar drawer scrim (only rendered on ≤ 1100px; main.js toggles [hidden] + .is-leaving and waits
+   200ms (= --d-2) before hiding it)
    -------------------------------------------------------------------------- */
 .sidebar-backdrop {
   position: fixed;
   inset: 0;
   z-index: calc(var(--z-sidebar) - 1);
-  background: var(--overlay);
+  background: var(--scrim-drawer);
   touch-action: none;
-  animation: app-fade-in var(--dur) var(--ease) both;
+  animation: app-fade-in var(--d-2) var(--ease-out) both;
 }
 
 .sidebar-backdrop[hidden] {
@@ -116,7 +255,7 @@
 
 .sidebar-backdrop.is-leaving {
   pointer-events: none;
-  animation: app-fade-out var(--dur) var(--ease) both;
+  animation: app-fade-out var(--d-2) var(--ease-out) both;
 }
 
 @keyframes app-fade-in {
@@ -132,12 +271,12 @@
 }
 
 /* --------------------------------------------------------------------------
-   Medium desktops (1101–1400px): slightly narrower side columns
+   Medium desktops (1101–1279px): slightly narrower side panels
    -------------------------------------------------------------------------- */
-@media (min-width: 1101px) and (max-width: 1400px) {
+@media (min-width: 1101px) and (max-width: 1279px) {
   :root {
     --sidebar-w: 232px;
-    --channels-w: 320px;
+    --list-w: 320px;
   }
 }
 
@@ -148,51 +287,56 @@
 }
 
 /* --------------------------------------------------------------------------
-   Tablets & small laptops (≤ 1100px): off-canvas sidebar
+   Tablets & small laptops (≤ 1100px): the sidebar floats in as a glass drawer
    -------------------------------------------------------------------------- */
 @media (max-width: 1100px) {
   :root {
-    --channels-w: clamp(280px, 38vw, 340px);
-    --app-stage-pad: var(--sp-5);
+    --app-pad: 12px;
+    --gap: 12px;
+    --list-w: clamp(296px, 40vw, 340px);
   }
 
   .app {
-    grid-template-columns: var(--channels-w) minmax(0, 1fr);
+    grid-template-columns: var(--list-w) minmax(0, 1fr);
     grid-template-areas: 'channels stage';
   }
 
   .sidebar {
     grid-area: auto;
     position: fixed;
-    inset: 0 auto 0 0;
     z-index: var(--z-sidebar);
-    width: calc(var(--app-drawer-w) + var(--app-safe-left));
-    padding-left: var(--app-safe-left);
-    transform: translateX(-100%);
+    top: max(var(--app-drawer-inset), var(--app-safe-top));
+    bottom: max(var(--app-drawer-inset), var(--app-safe-bottom));
+    left: max(var(--app-drawer-inset), var(--app-safe-left));
+    width: min(var(--drawer-w), calc(100vw - 2 * var(--app-drawer-inset) - var(--app-safe-left)));
+    background: var(--glass-sheen), var(--glass-bg-strong);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+    box-shadow: var(--shadow-pop);
+    transform: translateX(calc(-100% - 2 * var(--app-drawer-inset) - var(--app-safe-left)));
     visibility: hidden; /* keeps the closed drawer out of the tab order and the accessibility tree */
     transition:
-      transform var(--dur-slow) var(--ease),
-      box-shadow var(--dur-slow) var(--ease),
-      visibility 0s linear var(--dur-slow);
+      transform var(--d-3) var(--ease-out),
+      visibility 0s linear var(--d-3);
   }
 
   .app.is-sidebar-open .sidebar {
     transform: none;
     visibility: visible;
-    box-shadow: var(--shadow-3);
     transition:
-      transform var(--dur-slow) var(--ease),
-      box-shadow var(--dur-slow) var(--ease),
+      transform var(--d-3) var(--ease-out),
       visibility 0s linear 0s;
   }
 }
 
 /* --------------------------------------------------------------------------
-   Phones (≤ 720px): stage first and sticky, channel list below taking the remaining height
+   Phones (≤ 720px): stage first (video + compact now-playing), channel list panel taking the rest
    -------------------------------------------------------------------------- */
 @media (max-width: 720px) {
   :root {
-    --app-stage-pad: 0px;
+    --app-pad: 10px;
+    --gap: 10px;
+    --r-panel: 24px;
   }
 
   .app {
@@ -204,41 +348,33 @@
   }
 
   .stage {
-    order: -1;
-    position: sticky;
-    top: 0;
-    z-index: var(--z-sticky);
     align-items: stretch;
-    max-height: 72vh;
-    max-height: 72dvh; /* the list always keeps a usable share of the screen */
-    padding: var(--app-safe-top) 0 0;
-  }
-
-  .stage > * {
-    max-width: none;
   }
 
   .channels {
-    padding-top: 0;
+    border-radius: 26px;
+  }
+
+  /* No playlist yet: the welcome hero takes the screen; the empty list shrinks to its header (which holds
+     the drawer button) and its one-line hint (channels.css). */
+  .app[data-library='empty'] {
+    grid-template-rows: minmax(0, 1fr) auto;
   }
 }
 
-/* Phones held sideways: the stacked layout would leave no room for the list — go back to two columns. */
+/* Phones held sideways: the stacked layout would leave no room for the list; go back to two columns. */
 @media (max-width: 720px) and (orientation: landscape) and (max-height: 540px) {
-  .app {
+  .app,
+  .app[data-library='empty'] {
     grid-template-columns: minmax(220px, 40%) minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
     grid-template-areas: 'channels stage';
   }
 
   .stage {
-    position: static;
-    max-height: none;
-    padding: var(--app-safe-top) 0 var(--app-safe-bottom);
-  }
-
-  .channels {
-    padding-top: var(--app-safe-top);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 }
 
@@ -252,30 +388,32 @@
   display: grid;
   place-items: center;
   padding: var(--sp-6);
-  background: var(--overlay);
+  background: var(--scrim-bg);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
   opacity: 0;
   visibility: hidden;
   pointer-events: none; /* drag events keep reaching the page underneath */
   transition:
-    opacity var(--dur) var(--ease),
-    visibility 0s linear var(--dur);
+    opacity var(--d-2) var(--ease-out),
+    visibility 0s linear var(--d-2);
 }
 
 .app-dropzone::before {
   content: '';
   position: absolute;
-  inset: calc(var(--sp-4) + var(--app-safe-top)) calc(var(--sp-4) + var(--app-safe-right))
-    calc(var(--sp-4) + var(--app-safe-bottom)) calc(var(--sp-4) + var(--app-safe-left));
-  border: 2px dashed var(--accent);
-  border-radius: var(--radius-xl);
-  background: var(--accent-soft);
+  inset: max(var(--sp-4), var(--app-safe-top)) max(var(--sp-4), var(--app-safe-right))
+    max(var(--sp-4), var(--app-safe-bottom)) max(var(--sp-4), var(--app-safe-left));
+  border: 2px dashed rgb(var(--accent-rgb) / 0.7);
+  border-radius: var(--r-panel);
+  background: rgb(var(--accent-rgb) / 0.08);
 }
 
 .app-dropzone.is-active {
   opacity: 1;
   visibility: visible;
   transition:
-    opacity var(--dur) var(--ease),
+    opacity var(--d-2) var(--ease-out),
     visibility 0s linear 0s;
 }
 
@@ -287,12 +425,15 @@
   max-width: min(360px, 100%);
   padding: var(--sp-8) var(--sp-10);
   text-align: center;
-  background: var(--surface-1);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-3);
-  transform: scale(0.98);
-  transition: transform var(--dur) var(--ease);
+  color: var(--text);
+  background: var(--glass-sheen), var(--glass-bg-strong);
+  border-radius: var(--r-panel);
+  box-shadow:
+    var(--shadow-pop),
+    inset 0 0 0 1px var(--hairline-strong),
+    var(--glass-highlight);
+  transform: scale(0.96);
+  transition: transform var(--d-3) var(--ease-spring);
 }
 
 .app-dropzone.is-active .app-dropzone-panel {
@@ -305,15 +446,19 @@
   width: 60px;
   height: 60px;
   margin-bottom: var(--sp-3);
-  border-radius: var(--radius-lg);
-  background: var(--accent);
-  color: var(--accent-contrast);
-  box-shadow: var(--accent-glow);
+  border-radius: var(--r-tile);
+  color: var(--on-accent);
+  background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+    0 12px 28px -8px rgb(var(--accent-rgb) / 0.8),
+    0 0 0 8px rgb(var(--accent-rgb) / 0.08);
 }
 
 .app-dropzone-title {
   font-size: var(--fs-xl);
-  font-weight: var(--fw-semibold);
+  font-weight: var(--fw-heavy);
+  letter-spacing: var(--ls-title);
   line-height: var(--lh-tight);
   color: var(--text);
 }
@@ -330,14 +475,20 @@
 }
 
 /* --------------------------------------------------------------------------
-   Forced colors (Windows High Contrast): keep the drawer and the drop target visible
+   Forced colors (Windows High Contrast): give the panels, the drawer and the drop target real edges
    -------------------------------------------------------------------------- */
 @media (forced-colors: active) {
-  .app-dropzone::before {
-    border-color: Highlight;
+  .sidebar,
+  .channels {
+    border: 1px solid CanvasText;
   }
 
-  .app.is-sidebar-open .sidebar {
-    border-right: 1px solid CanvasText;
+  .sidebar::after,
+  .channels::after {
+    display: none;
+  }
+
+  .app-dropzone::before {
+    border-color: Highlight;
   }
 }

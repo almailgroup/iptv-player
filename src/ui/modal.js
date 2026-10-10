@@ -88,6 +88,8 @@ function rescueToasts(dialog) {
  * @param {{
  *   title: string | Node,
  *   description?: string | Node | Array<string|Node>,
+ *   icon?: string,
+ *   tone?: 'accent'|'danger'|'neutral',
  *   body?: Node | string | Array<Node|string>,
  *   footer?: Node | Node[],
  *   size?: 'sm'|'md'|'lg',
@@ -98,6 +100,8 @@ function rescueToasts(dialog) {
  *   role?: 'dialog'|'alertdialog',
  *   returnFocus?: HTMLElement | (() => HTMLElement | null | undefined),
  * }} options
+ *   - `icon` (an icons.js name) shows a 44px squircle before the title, in the accent gradient or, with
+ *     `tone: 'danger'`, a danger tint (`'neutral'`: a quiet glassy tile).
  *   - `footer` nodes are right-aligned; give a node the class `md-footer-start` to pin it to the left.
  *   - `initialFocus`: element or selector (within the dialog). Defaults to the first focusable control in
  *     the body, then the footer, then the close button.
@@ -112,6 +116,8 @@ export function openModal(options = {}) {
   const {
     title = '',
     description,
+    icon: iconName,
+    tone = 'accent',
     body,
     footer,
     size = 'md',
@@ -145,7 +151,7 @@ export function openModal(options = {}) {
         'button',
         {
           type: 'button',
-          class: 'icon-btn icon-btn-sm md-close',
+          class: 'icon-btn icon-btn-filled md-close',
           'aria-label': 'Close',
           onClick: () => close(),
         },
@@ -156,6 +162,13 @@ export function openModal(options = {}) {
   const header = h(
     'header',
     { class: 'md-header' },
+    iconName
+      ? h(
+          'span',
+          { class: 'md-icon', dataset: { tone }, 'aria-hidden': 'true' },
+          icon(iconName, { size: 22 }),
+        )
+      : null,
     h(
       'div',
       { class: 'md-heading' },
@@ -220,10 +233,21 @@ export function openModal(options = {}) {
   el.addEventListener('transitionend', (e) => {
     if (entry.state === 'closing' && e.target === el && e.propertyName === 'opacity') finalize();
   });
+  // Scroll affordances: `data-scrolled` (content passed under the header) and `data-more` (more content
+  // below the fold, so the footer shows its hairline). Re-measured when the body or its content resizes.
+  let resizeObserver = null;
+  const syncScroll = () => {
+    if (!bodyEl) return;
+    el.toggleAttribute('data-scrolled', bodyEl.scrollTop > 0);
+    el.toggleAttribute('data-more', bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight > 1);
+  };
   if (bodyEl) {
-    bodyEl.addEventListener('scroll', () => el.toggleAttribute('data-scrolled', bodyEl.scrollTop > 0), {
-      passive: true,
-    });
+    bodyEl.addEventListener('scroll', syncScroll, { passive: true });
+    if (typeof ResizeObserver === 'function') {
+      resizeObserver = new ResizeObserver(() => syncScroll());
+      resizeObserver.observe(bodyEl);
+      for (const child of bodyEl.children) resizeObserver.observe(child);
+    }
   }
 
   function close(value) {
@@ -251,6 +275,7 @@ export function openModal(options = {}) {
     if (entry.state === 'closed' || typeof document === 'undefined') return; // page already torn down
     entry.state = 'closed';
     clearTimeout(exitTimer);
+    resizeObserver?.disconnect();
     const index = stack.indexOf(entry);
     if (index !== -1) stack.splice(index, 1);
     const ae = document.activeElement;
@@ -304,6 +329,7 @@ export function openModal(options = {}) {
   // Flush styles so the enter transition starts from the initial (transparent, scaled) state.
   el.getBoundingClientRect();
   el.classList.add('is-open');
+  syncScroll();
   focusInitial();
 
   return { el, close, result };
@@ -312,7 +338,9 @@ export function openModal(options = {}) {
 /**
  * Ask the user to confirm an action.
  * @param {{ title: string, message?: string | Node | Array<string|Node>, confirmLabel?: string,
- *   cancelLabel?: string, danger?: boolean, returnFocus?: HTMLElement | (() => HTMLElement|null) }} opts
+ *   cancelLabel?: string, danger?: boolean, icon?: string,
+ *   returnFocus?: HTMLElement | (() => HTMLElement|null) }} opts
+ *   `icon` defaults to an alert sign (danger tint) for destructive actions, else an info sign.
  * @returns {Promise<boolean>} true only when the confirm button was pressed.
  */
 export function confirmDialog({
@@ -321,6 +349,7 @@ export function confirmDialog({
   confirmLabel = 'Confirm',
   cancelLabel = 'Cancel',
   danger = false,
+  icon: iconName = danger ? 'alert' : 'info',
   returnFocus,
 } = {}) {
   let handle = null;
@@ -339,6 +368,8 @@ export function confirmDialog({
   handle = openModal({
     title,
     description: message,
+    icon: iconName,
+    tone: danger ? 'danger' : 'accent',
     footer: [cancelBtn, confirmBtn],
     size: 'sm',
     role: 'alertdialog',
@@ -354,7 +385,7 @@ export function confirmDialog({
  * Ask the user for a single line of text.
  * @param {{
  *   title: string, label: string, value?: string, placeholder?: string, confirmLabel?: string,
- *   cancelLabel?: string, description?: string, maxLength?: number, required?: boolean,
+ *   cancelLabel?: string, description?: string, maxLength?: number, required?: boolean, icon?: string,
  *   validate?: (value: string) => string | boolean | null | undefined
  *     | Promise<string | boolean | null | undefined>,
  *   returnFocus?: HTMLElement | (() => HTMLElement|null),
@@ -374,6 +405,7 @@ export function promptDialog({
   maxLength = 200,
   required = true,
   validate,
+  icon: iconName = 'edit',
   returnFocus,
 } = {}) {
   let handle = null;
@@ -464,6 +496,7 @@ export function promptDialog({
   handle = openModal({
     title,
     description,
+    icon: iconName,
     body: form,
     footer: [cancelBtn, submitBtn],
     size: 'sm',

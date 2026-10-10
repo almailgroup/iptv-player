@@ -237,6 +237,42 @@ export function selectVisibleChannels(state) {
   return visible(channels, state.query, list.length, list.length - channels.length);
 }
 
+// ---- Player shelf (up next / recently watched / favorites) -------------------------------------------------
+
+/** The most tiles a shelf tab shows: the shelf is a glance, not a second channel list. */
+export const SHELF_LIMIT = 24;
+
+const upNext = memo((items, currentId, playabilityOf, limit) => {
+  const count = items.length;
+  if (!count) return { channels: [], next: null };
+  // Same order as playNext(): the channels after the current one (wrapping), or from the top of the list when
+  // the current channel isn't in it (or nothing plays).
+  const index = currentId === null ? -1 : items.findIndex((item) => item.channel.id === currentId);
+  const start = index + 1;
+  const first = items[start % count].channel;
+  const channels = [];
+  for (let k = 0; k < count && channels.length < limit; k++) {
+    const channel = items[(start + k) % count].channel;
+    if (channel.id !== currentId && !playabilityOf(channel)) channels.push(channel);
+  }
+  return { channels, next: first.id === currentId ? null : first };
+});
+/**
+ * What plays after the current channel, for the player's "Up next" shelf: the visible list's following
+ * channels (wrapping around), skipping the current channel and every channel selectPlayability() flags.
+ * @returns {{ channels: object[], next: object | null }} at most `limit` channels; `next` is the channel
+ *   playNext() would pick (it doesn't skip unplayable ones), null when that is the current channel itself.
+ *   Memoized: the same object while the list, the current channel and the playability are unchanged.
+ */
+export const selectUpNext = (state, limit = SHELF_LIMIT) =>
+  upNext(selectVisibleChannels(state).items, state.currentChannel?.id ?? null, selectPlayability(state), limit);
+
+/** Recently watched channels, most recent first, resolved against the active playlist (state.recents order). */
+export const selectRecentChannels = (state) => recentChannels(state.recents, selectChannelMap(state));
+
+/** Favorite channels in the order they were starred, resolved against the active playlist. */
+export const selectFavoriteChannels = (state) => favoriteChannels(state.favorites, selectChannelMap(state));
+
 /** Human label for the current category. */
 export function selectCategoryLabel(state) {
   const { category } = state;

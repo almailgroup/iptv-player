@@ -59,8 +59,6 @@ const stripExtension = (name) =>
     .replace(/\.(m3u8?|txt)$/i, '')
     .trim();
 
-const displayUrl = (url) => String(url).replace(/^https?:\/\//i, '');
-
 const isCoarsePointer = () => typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 
 const spinner = () => h('span', { class: 'spinner spinner-sm', 'aria-hidden': 'true' });
@@ -106,20 +104,33 @@ function usageBytes() {
   }
 }
 
-/** Label row + control + optional error slot. */
+/** Label ("Name · optional") + control + optional error slot. */
 function field({ id, label, control, error, optional = false }) {
   return h(
     'div',
     { class: 'field' },
     h(
-      'div',
-      { class: 'dlg-label-row' },
-      h('label', { class: 'field-label', htmlFor: id, text: label }),
-      optional ? h('span', { class: 'dlg-optional', text: 'Optional' }) : null,
+      'label',
+      { class: 'field-label', htmlFor: id },
+      label,
+      optional ? h('span', { class: 'dlg-optional', text: ' · optional' }) : null,
     ),
     control,
     error || null,
   );
+}
+
+/** Input with a leading icon (e.g. the link glyph in URL fields). */
+const withIcon = (name, input) => h('div', { class: 'input-group' }, icon(name, { size: 18 }), input);
+
+/**
+ * Chip text for a suggested playlist: drops the shared "iptv-org · " prefix (the note under the chips names
+ * the source) and turns a trailing "(large)" into a small tag.
+ */
+function suggestionLabel(name) {
+  const short = String(name || '').replace(/^iptv-org\s*·\s*/i, '');
+  const match = /^(.*\S)\s*\(([^)]+)\)$/.exec(short);
+  return match ? { text: match[1], tag: match[2] } : { text: short, tag: '' };
 }
 
 const errorSlot = (id) => h('p', { class: 'field-error dlg-error', id, 'aria-live': 'polite' });
@@ -183,7 +194,7 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
       'aria-controls': ids.panelUrl,
       onClick: () => select('url'),
     },
-    icon('link', { size: 15 }),
+    icon('link', { size: 16 }),
     h('span', { text: 'Link' }),
   );
   const tabFile = h(
@@ -195,13 +206,13 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
       'aria-controls': ids.panelFile,
       onClick: () => select('file'),
     },
-    icon('upload', { size: 15 }),
+    icon('upload', { size: 16 }),
     h('span', { text: 'File' }),
   );
   const tabs = h(
     'div',
     {
-      class: 'segmented dlg-tabs',
+      class: 'segmented segmented-block dlg-tabs',
       role: 'tablist',
       'aria-label': 'Playlist source',
       onKeydown: (e) => {
@@ -254,7 +265,7 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
         submitUrl();
       },
     },
-    field({ id: ids.url, label: 'Playlist URL', control: urlInput, error: urlError }),
+    field({ id: ids.url, label: 'Playlist URL', control: withIcon('link', urlInput), error: urlError }),
     field({ id: ids.urlName, label: 'Name', control: urlName, optional: true }),
   );
 
@@ -267,7 +278,8 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
         h(
           'ul',
           { class: 'dlg-suggest-list' },
-          SUGGESTED_PLAYLISTS.map((s) => {
+          SUGGESTED_PLAYLISTS.map((s, i) => {
+            const label = suggestionLabel(s.name);
             const btn = h(
               'button',
               {
@@ -275,34 +287,29 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
                 class: 'dlg-suggest-item',
                 title: s.url,
                 'aria-label': `Load ${s.name}`,
+                // Hue dots spread evenly around the wheel, starting at blue.
+                style: { '--h': Math.round(215 + (i * 360) / SUGGESTED_PLAYLISTS.length) % 360 },
                 onClick: () => useSuggestion(s),
               },
-              h('span', { class: 'dlg-suggest-icon', 'aria-hidden': 'true' }, icon('broadcast', { size: 15 })),
-              h(
-                'span',
-                { class: 'dlg-suggest-text' },
-                h('span', { class: 'dlg-suggest-name truncate', text: s.name }),
-                h('span', { class: 'dlg-suggest-url truncate', text: displayUrl(s.url) }),
-              ),
-              icon('arrow-right', { size: 16, class: 'dlg-suggest-go' }),
+              h('span', { class: 'dlg-suggest-dot', 'aria-hidden': 'true' }),
+              h('span', { class: 'dlg-suggest-name', text: label.text }),
+              label.tag ? h('span', { class: 'dlg-suggest-tag', text: label.tag }) : null,
             );
             suggestionButtons.push(btn);
             return h('li', null, btn);
           }),
         ),
-        h(
-          'p',
-          { class: 'dlg-note' },
-          icon('info', { size: 13 }),
-          h('span', { text: 'Community playlists from iptv-org (third-party). Availability varies.' }),
-        ),
+        h('p', {
+          class: 'dlg-note',
+          text: 'Community playlists from iptv-org (third-party). Availability varies.',
+        }),
       )
     : null;
 
   const demoError = errorSlot(ids.demoError);
   const demoBtn = h('button', {
     type: 'button',
-    class: 'btn btn-ghost btn-sm dlg-demo-btn',
+    class: 'btn btn-secondary dlg-demo-btn',
     'aria-describedby': ids.demoError,
     onClick: () => loadDemo(),
   });
@@ -345,7 +352,7 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
       fileInput.value = ''; // allow re-picking the same file
     },
   });
-  const dropIcon = h('span', { class: 'dlg-drop-icon', 'aria-hidden': 'true' }, icon('upload', { size: 22 }));
+  const dropIcon = h('span', { class: 'dlg-drop-icon', 'aria-hidden': 'true' }, icon('upload', { size: 24 }));
   const dropTitle = h('span', { class: 'dlg-drop-title' });
   const dropHint = h('span', { class: 'dlg-drop-hint' });
   const drop = h(
@@ -448,7 +455,7 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
     replaceChildren(
       demoBtn,
       kind === 'demo' ? spinner() : icon('play', { size: 14 }),
-      kind === 'demo' ? 'Loading demo…' : 'Load demo channels',
+      kind === 'demo' ? 'Loading demo…' : 'Try demo channels',
     );
     panelUrl.setAttribute('aria-busy', String(kind === 'url' || kind === 'demo'));
     panelFile.setAttribute('aria-busy', String(kind === 'file'));
@@ -459,7 +466,7 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
   function renderDrop() {
     drop.classList.toggle('has-file', !!selectedFile);
     if (selectedFile) {
-      setIcon(dropIcon, 'file', { size: 22 });
+      setIcon(dropIcon, 'file', { size: 24 });
       dropTitle.textContent = selectedFile.name || 'Playlist file';
       replaceChildren(
         dropHint,
@@ -468,7 +475,7 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
         ' or drop to replace',
       );
     } else {
-      setIcon(dropIcon, 'upload', { size: 22 });
+      setIcon(dropIcon, 'upload', { size: 24 });
       dropTitle.textContent = 'Drop an .m3u / .m3u8 file here';
       replaceChildren(dropHint, 'or ', h('span', { class: 'dlg-drop-link', text: 'browse' }), ' your files');
     }
@@ -574,7 +581,8 @@ export function openAddPlaylistDialog({ store, actions, tab = 'url', file } = {}
 
   handle = openModal({
     title: 'Add playlist',
-    description: 'Load an M3U / M3U8 playlist from a link or from a file on this device.',
+    description: 'Paste an M3U / M3U8 link or pick a file from this device.',
+    icon: 'plus',
     body: h('div', { class: 'dlg-add' }, tabs, panelUrl, panelFile),
     footer: [status, cancelBtn, submitBtn],
     size: 'md',
@@ -869,6 +877,7 @@ export function openPlaylistManager({ store, actions }) {
       } This can’t be undone.`,
       confirmLabel: 'Delete',
       danger: true,
+      icon: 'trash',
       // Evaluated after the confirm has closed — by then the row is gone, so land on a neighbour.
       returnFocus: () => focusAfter,
     });
@@ -899,6 +908,7 @@ export function openPlaylistManager({ store, actions }) {
   handle = openModal({
     title: 'Playlists',
     description: 'Switch between, refresh or remove the playlists saved in this browser.',
+    icon: 'playlist',
     body: h('div', { class: 'dlg-manager' }, list, empty),
     footer: [usage, addBtn],
     size: 'lg',
@@ -1190,6 +1200,14 @@ export async function checkProxyHealth(
 
 const CHECK_ICON = { ok: 'check', warning: 'alert', error: 'alert' };
 
+/** Hints of the "Ambient colour from video" switch. */
+const AMBIENT_HINT = {
+  on: 'Tint the background with colours from the playing video.',
+  reducedMotion:
+    'Tint the background with colours from the playing video. Paused while your device is set to reduce ' +
+    'motion.',
+};
+
 /** Settings hints of the "Use the built-in relay" switch. */
 const BUILTIN_HINT = {
   on:
@@ -1327,9 +1345,26 @@ export function openSettingsDialog({ store, actions }) {
     if (retries.value !== String(n)) retries.value = String(n);
     if (n !== settings().maxRetries) apply({ maxRetries: n });
   }
+  // − [n] + : the buttons are pointer shortcuts (the spin button itself handles ↑ / ↓), so they stay out of
+  // the Tab order.
+  const stepButton = (delta, label) =>
+    h('button', {
+      type: 'button',
+      class: ['dlg-stepper-btn', delta > 0 && 'is-plus'],
+      tabIndex: -1,
+      'aria-label': label,
+      onClick: () => {
+        if (retries.disabled) return;
+        const current = parseRetries(retries.value) ?? settings().maxRetries;
+        retries.value = String(clamp(current + delta, 1, 30));
+        commitRetries();
+      },
+    });
+  const retriesDown = stepButton(-1, 'Fewer retries');
+  const retriesUp = stepButton(1, 'More retries');
   const retriesRow = h(
     'div',
-    { class: 'dlg-row dlg-row-sub' },
+    { class: 'dlg-row dlg-row-sub dlg-row-stepper' },
     h(
       'span',
       { class: 'dlg-row-text' },
@@ -1340,7 +1375,7 @@ export function openSettingsDialog({ store, actions }) {
         text: 'Reconnect attempts before giving up (1\u2060–\u206030).',
       }),
     ),
-    retries,
+    h('span', { class: 'dlg-stepper' }, retriesDown, retries, retriesUp),
   );
 
   // ----- Auto-refresh -----
@@ -1554,6 +1589,7 @@ export function openSettingsDialog({ store, actions }) {
   }
   async function clearData() {
     const ok = await confirmDialog({
+      icon: 'trash',
       title: 'Clear all data?',
       message:
         'This permanently removes every playlist, favorite, watch-history entry and setting saved by this ' +
@@ -1579,9 +1615,10 @@ export function openSettingsDialog({ store, actions }) {
   });
   async function resetDefaults() {
     const ok = await confirmDialog({
+      icon: 'rotate-ccw',
       title: 'Reset settings?',
       message:
-        'Playback, library and network settings go back to their defaults. ' +
+        'Playback, library, network and ambient colour settings go back to their defaults. ' +
         'Playlists, favorites and your theme are kept.',
       confirmLabel: 'Reset',
     });
@@ -1593,13 +1630,24 @@ export function openSettingsDialog({ store, actions }) {
     }
   }
 
+  // ----- Appearance -----
+  // The page-wide tint follows the video only with motion allowed (the player pauses it otherwise): say so.
+  const reducedMotion =
+    typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null;
+  const ambientRow = switchRow('ambientColor', 'Ambient colour from video', AMBIENT_HINT.on);
+  const ambientHint = ambientRow.querySelector('.dlg-row-hint');
+  const renderAmbientHint = () => {
+    ambientHint.textContent = reducedMotion?.matches ? AMBIENT_HINT.reducedMotion : AMBIENT_HINT.on;
+  };
+  reducedMotion?.addEventListener?.('change', renderAmbientHint);
+
   // ----- Layout -----
-  const section = (title, children, cardClass) => {
+  const section = (title, iconName, children, cardClass) => {
     const id = uid('dlg-sec');
     return h(
       'section',
       { class: 'dlg-section', 'aria-labelledby': id },
-      h('h3', { class: 'dlg-section-title', id, text: title }),
+      h('h3', { class: 'dlg-section-title', id }, icon(iconName, { size: 14 }), title),
       h('div', { class: ['dlg-card', cardClass] }, children),
     );
   };
@@ -1607,7 +1655,7 @@ export function openSettingsDialog({ store, actions }) {
   const body = h(
     'div',
     { class: 'dlg-settings' },
-    section('Playback', [
+    section('Playback', 'play', [
       switchRow('autoplay', 'Autoplay', 'Start playback as soon as you pick a channel.'),
       switchRow('autoReconnect', 'Auto-reconnect', 'Retry automatically when a stream drops or stalls.'),
       retriesRow,
@@ -1623,7 +1671,7 @@ export function openSettingsDialog({ store, actions }) {
         'Use the browser’s built-in HLS playback when available (Safari).',
       ),
     ]),
-    section('Library', [
+    section('Library', 'list', [
       switchRow(
         'showLogos',
         'Show channel logos',
@@ -1636,13 +1684,12 @@ export function openSettingsDialog({ store, actions }) {
       ),
       refreshRow,
     ]),
-    section('Network', [builtinRow, proxyRow, proxyStreamsRow]),
-    section(
-      'Appearance',
-      [h('div', { class: 'dlg-card-pad' }, createThemePicker({ store, actions }))],
-      'dlg-card-plain',
-    ),
-    section('Data', [dataRow]),
+    section('Network', 'broadcast', [builtinRow, proxyRow, proxyStreamsRow]),
+    section('Appearance', 'palette', [
+      h('div', { class: 'dlg-card-pad dlg-theme' }, createThemePicker({ store, actions })),
+      ambientRow,
+    ]),
+    section('Data', 'folder', [dataRow]),
   );
 
   function sync() {
@@ -1650,6 +1697,8 @@ export function openSettingsDialog({ store, actions }) {
     for (const { key, input } of switches) input.checked = !!s[key];
     const reconnect = !!s.autoReconnect;
     retries.disabled = !reconnect;
+    retriesDown.disabled = !reconnect || s.maxRetries <= 1;
+    retriesUp.disabled = !reconnect || s.maxRetries >= 30;
     retriesRow.classList.toggle('is-disabled', !reconnect);
     if (document.activeElement !== retries) retries.value = String(s.maxRetries);
     renderRefreshOptions(Number(s.autoRefreshHours));
@@ -1670,6 +1719,7 @@ export function openSettingsDialog({ store, actions }) {
     }
     renderProxyTools();
     renderUsage();
+    renderAmbientHint();
   }
 
   sync();
@@ -1683,6 +1733,7 @@ export function openSettingsDialog({ store, actions }) {
   handle = openModal({
     title: 'Settings',
     description: 'Changes are saved automatically.',
+    icon: 'settings',
     body,
     footer: [resetBtn, doneBtn],
     size: 'md',
@@ -1691,6 +1742,7 @@ export function openSettingsDialog({ store, actions }) {
     onClose: () => {
       closed = true;
       unsubscribe();
+      reducedMotion?.removeEventListener?.('change', renderAmbientHint);
       commitProxyLater.cancel();
       cancelProxyTest();
       commitProxy(false); // keep a valid relay address typed right before closing
@@ -1831,6 +1883,7 @@ export function openProxyGuide({ store, actions }) {
       if (closed) return;
       if (!ok) {
         toast.error('Couldn’t copy the relay code', {
+          detail: 'Download it instead, then paste the file’s contents.',
           action: {
             label: 'Download',
             onClick: () => downloadText('stream-proxy.js', source, 'text/javascript'),
@@ -1838,7 +1891,7 @@ export function openProxyGuide({ store, actions }) {
         });
         return;
       }
-      toast.success('Relay code copied');
+      toast.success('Relay code copied', { detail: 'Paste it into the editor, replacing everything.' });
       btn.classList.add('is-done');
       setIcon(btn, 'check', { size: 14 });
       label.textContent = 'Copied';
@@ -1939,7 +1992,7 @@ export function openProxyGuide({ store, actions }) {
   const tablist = h(
     'div',
     {
-      class: 'segmented dlg-tabs dlg-guide-tabs',
+      class: 'segmented segmented-block dlg-tabs dlg-guide-tabs',
       role: 'tablist',
       'aria-label': 'Where to host your relay',
       onKeydown: (e) => {
@@ -2114,6 +2167,7 @@ export function openProxyGuide({ store, actions }) {
 
   modal = openModal({
     title: builtin ? 'Use your own relay' : 'Play blocked channels',
+    icon: 'broadcast',
     description: builtin
       ? 'Optional — this site’s built-in relay already plays blocked channels.'
       : 'Your own free relay lets you watch them here too.',
@@ -2162,7 +2216,7 @@ export function openShortcutsDialog() {
         { class: 'dlg-key-combo' },
         (shortcut.label || []).map((label, i) => [
           i > 0 ? h('span', { class: 'dlg-key-or', text: 'or' }) : null,
-          h('kbd', { class: 'kbd', text: label }),
+          h('kbd', { class: 'kbd dlg-kbd', text: label }),
         ]),
       ),
     ),
@@ -2177,6 +2231,7 @@ export function openShortcutsDialog() {
   handle = openModal({
     title: 'Keyboard shortcuts',
     description: ['Press ', h('kbd', { class: 'kbd', text: '?' }), ' anytime to open this list.'],
+    icon: 'keyboard',
     body: h(
       'div',
       { class: 'dlg-shortcuts' },

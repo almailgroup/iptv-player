@@ -1,6 +1,7 @@
 /* ==========================================================================
-   Base: reset, typography and shared UI primitives
-   (buttons, inputs, switches, chips, badges, kbd, spinner, menus, popovers, toasts, empty states)
+   Base: reset, typography and shared UI primitives in the Ambient Glass language
+   (glass panel, buttons, icon buttons, inputs, switches, segmented control, chips, badges, kbd, spinner,
+   skeleton, avatar, menus, popovers, toasts, empty states). Class names are used by src/ui/*.js; keep them.
    ========================================================================== */
 
 *,
@@ -24,8 +25,9 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: var(--font-sans);
+  font-family: var(--font);
   font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
   line-height: var(--lh);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -83,49 +85,51 @@ ol {
   list-style: none;
 }
 
+/* Search highlight: a filled accent tint, readable wherever it lands (rows override it on the current row
+   with --mark-bg-current / --mark-text-current). */
 mark,
 .hl {
-  background: var(--accent-soft-strong);
-  color: inherit;
-  border-radius: 3px;
+  background: var(--mark-bg);
+  color: var(--mark-text);
+  border-radius: 4px;
   padding: 0 1px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
 }
 
 ::selection {
-  background: var(--accent-soft-strong);
+  background: rgb(var(--accent-rgb) / 0.32);
 }
 
 :focus {
   outline: none;
 }
 :focus-visible {
-  outline: 2px solid var(--accent-ring);
-  outline-offset: 2px;
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
 }
 
 .icon {
   flex: none;
 }
 
-/* Scrollbars */
+/* Scrollbars: thin and rounded. Browsers that support the standard properties ignore the -webkit- ones. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--surface-3) transparent;
+  scrollbar-color: var(--scrollbar) transparent;
 }
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--surface-3);
+  background: var(--scrollbar);
   border-radius: 10px;
   border: 3px solid transparent;
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover {
-  background-color: var(--border-strong);
-}
-::-webkit-scrollbar-track {
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 
@@ -161,85 +165,161 @@ mark,
   color: var(--text-faint);
 }
 
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
 .mono {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
 
+/* Shown by index.html when JavaScript is off (no inline styles: the production CSP forbids them). */
+.noscript {
+  padding: var(--sp-6);
+  color: var(--text);
+}
+
 /* --------------------------------------------------------------------------
-   Buttons
+   Glass panel: translucent fill + sheen, light-catching gradient hairline, soft shadow. No backdrop blur:
+   docked panels only sit over soft fields. Add .glass-float for surfaces over sharp content (menus,
+   drawer, toasts, dialog): stronger fill + backdrop blur.
+   <div class="glass">…</div>   (needs no ::before of its own; the hairline uses it)
+   -------------------------------------------------------------------------- */
+.glass {
+  position: relative;
+  isolation: isolate; /* keeps the hairline's z-index inside the card */
+  background: var(--glass-sheen), var(--glass-bg);
+  border-radius: var(--r-panel);
+  box-shadow: var(--glass-shadow);
+}
+.glass::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  padding: 1px;
+  border-radius: inherit;
+  background: var(--glass-edge);
+  pointer-events: none;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+.glass-float {
+  background: var(--glass-sheen), var(--glass-bg-strong);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow:
+    var(--shadow-pop),
+    inset 0 0 0 1px var(--hairline-strong),
+    var(--glass-highlight);
+}
+
+/* --------------------------------------------------------------------------
+   Buttons (pills)
    .btn [.btn-primary | .btn-secondary | .btn-ghost | .btn-danger] [.btn-sm | .btn-lg] [.btn-block]
-   .icon-btn [.icon-btn-sm] [.is-active]
+   .icon-btn [.icon-btn-sm] [.icon-btn-filled] [.is-active]
    -------------------------------------------------------------------------- */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: var(--sp-2);
-  height: var(--control-h);
-  padding: 0 var(--sp-4);
-  border-radius: var(--radius-sm);
+  height: var(--btn-h);
+  padding: 0 18px;
+  border: 0;
+  border-radius: var(--r-pill);
   font-size: var(--fs-md);
-  font-weight: var(--fw-medium);
+  font-weight: var(--fw-strong);
+  letter-spacing: -0.005em;
+  line-height: 1;
   white-space: nowrap;
-  border: 1px solid transparent;
   transition:
-    background-color var(--dur-fast) var(--ease),
-    border-color var(--dur-fast) var(--ease),
-    color var(--dur-fast) var(--ease),
-    box-shadow var(--dur-fast) var(--ease),
-    transform var(--dur-fast) var(--ease);
+    background-color var(--d-1) var(--ease-out),
+    color var(--d-1) var(--ease-out),
+    box-shadow var(--d-2) var(--ease-out),
+    opacity var(--d-1) var(--ease-out),
+    transform var(--d-2) var(--ease-spring);
   user-select: none;
+  -webkit-user-select: none;
 }
 .btn:active:not(:disabled) {
-  transform: translateY(1px);
+  transform: scale(0.97);
 }
 .btn:disabled {
   opacity: 0.5;
 }
+
+/* Primary: accent gradient (light on top, solid under the label) with a soft accent glow. */
 .btn-primary {
-  background: var(--accent);
-  color: var(--accent-contrast);
-  box-shadow: var(--accent-glow);
+  color: var(--on-accent);
+  background-color: var(--accent);
+  background-image: linear-gradient(180deg, var(--accent-hi), var(--accent) 45%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 10px 30px -8px rgb(var(--accent-rgb) / 0.7),
+    0 2px 6px -2px rgb(var(--accent-rgb) / 0.6);
 }
 .btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+    0 14px 34px -8px rgb(var(--accent-rgb) / 0.85),
+    0 2px 8px -2px rgb(var(--accent-rgb) / 0.7);
 }
+:root[data-mode='light'] .btn-primary {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 10px 24px -10px rgb(var(--accent-rgb) / 0.75),
+    0 2px 6px -2px rgb(var(--accent-rgb) / 0.45);
+}
+
+/* Secondary ("glassy"): translucent fill, hairline ring, top highlight. */
 .btn-secondary {
-  background: var(--surface-2);
-  border-color: var(--border);
   color: var(--text);
+  background: var(--fill-2);
+  box-shadow:
+    inset 0 0 0 1px var(--hairline-strong),
+    var(--glass-highlight);
 }
 .btn-secondary:hover:not(:disabled) {
-  background: var(--surface-3);
-  border-color: var(--border-strong);
+  background: var(--fill-3);
 }
+
 .btn-ghost {
   color: var(--text-muted);
 }
 .btn-ghost:hover:not(:disabled) {
-  background: var(--surface-hover);
+  background: var(--fill-2);
   color: var(--text);
 }
+
 .btn-danger {
-  background: var(--danger-soft);
   color: var(--danger);
+  background: var(--danger-soft);
+  box-shadow: inset 0 0 0 1px rgb(var(--danger-rgb) / 0.28);
 }
 .btn-danger:hover:not(:disabled) {
-  background: var(--danger);
-  color: #fff;
+  background: rgb(var(--danger-rgb) / 0.22);
+  box-shadow: inset 0 0 0 1px rgb(var(--danger-rgb) / 0.4);
 }
+
 .btn-sm {
-  height: 30px;
-  padding: 0 var(--sp-3);
-  font-size: var(--fs-sm);
+  height: var(--btn-h-sm);
+  padding: 0 14px;
+  font-size: 13px;
   gap: 6px;
 }
 .btn-lg {
-  height: 44px;
-  padding: 0 var(--sp-5);
-  font-size: var(--fs-lg);
-  border-radius: var(--radius);
+  height: var(--btn-h-lg);
+  padding: 0 26px;
+  font-size: 15.5px;
+  gap: 10px;
 }
 .btn-block {
   width: 100%;
@@ -248,81 +328,104 @@ mark,
 .icon-btn {
   display: inline-grid;
   place-items: center;
-  width: var(--control-h);
-  height: var(--control-h);
+  width: var(--icon-btn);
+  height: var(--icon-btn);
   flex: none;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-pill);
   color: var(--text-muted);
   transition:
-    background-color var(--dur-fast) var(--ease),
-    color var(--dur-fast) var(--ease);
+    background-color var(--d-1) var(--ease-out),
+    color var(--d-1) var(--ease-out),
+    box-shadow var(--d-2) var(--ease-out),
+    transform var(--d-2) var(--ease-spring);
 }
 .icon-btn:hover:not(:disabled) {
-  background: var(--surface-hover);
+  background: var(--fill-2);
   color: var(--text);
 }
 .icon-btn:active:not(:disabled) {
-  background: var(--surface-active);
+  transform: scale(0.94);
 }
 .icon-btn.is-active,
 .icon-btn[aria-pressed='true'],
 .icon-btn[aria-expanded='true'] {
   color: var(--accent-text);
-  background: var(--accent-soft);
+  background: rgb(var(--accent-rgb) / 0.16);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.28);
 }
 .icon-btn:disabled {
   opacity: 0.4;
 }
 .icon-btn-sm {
-  width: 28px;
-  height: 28px;
+  width: var(--icon-btn-sm);
+  height: var(--icon-btn-sm);
+}
+/* Quiet filled variant (card actions, toolbar buttons that should read as buttons at rest). */
+.icon-btn-filled {
+  color: var(--text);
+  background: var(--fill-1);
+  box-shadow: inset 0 0 0 1px var(--hairline);
 }
 
 /* --------------------------------------------------------------------------
    Form controls
+   .input (48px form field, radius 16) [.input-sm] · .input-group [.input-search] > .icon + .input + .input-trailing
    -------------------------------------------------------------------------- */
 .input {
   width: 100%;
-  height: var(--control-h);
-  padding: 0 var(--sp-3);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  height: var(--field-h);
+  padding: 0 var(--sp-4);
+  background: var(--fill-1);
+  border: 0;
+  border-radius: var(--r-input);
+  box-shadow: inset 0 0 0 1px var(--hairline-strong);
   color: var(--text);
-  font-size: var(--fs-md);
+  font-size: var(--fs-row);
+  font-weight: var(--fw-medium);
   transition:
-    border-color var(--dur-fast) var(--ease),
-    box-shadow var(--dur-fast) var(--ease),
-    background-color var(--dur-fast) var(--ease);
+    box-shadow var(--d-2) var(--ease-out),
+    background-color var(--d-2) var(--ease-out);
 }
 .input::placeholder {
   color: var(--text-faint);
+  opacity: 1;
 }
 .input:hover {
-  border-color: var(--border-strong);
+  background: var(--fill-2);
 }
 .input:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-  background: var(--surface-1);
+  background: var(--fill-2);
+  box-shadow:
+    inset 0 0 0 1.5px rgb(var(--accent-rgb) / 0.6),
+    0 0 0 4px rgb(var(--accent-rgb) / 0.15);
 }
 .input[aria-invalid='true'] {
-  border-color: var(--danger);
+  box-shadow:
+    inset 0 0 0 1.5px var(--danger),
+    0 0 0 4px var(--danger-soft);
+}
+.input:disabled {
+  opacity: 0.55;
 }
 textarea.input {
   height: auto;
   min-height: 96px;
-  padding: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
   resize: vertical;
   line-height: var(--lh);
 }
+select.input {
+  cursor: pointer;
+}
 .input-sm {
-  height: 30px;
-  font-size: var(--fs-sm);
+  height: 36px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-sm);
+  font-size: 13px;
 }
 
-/* Input with a leading icon and optional trailing slot */
+/* Input with a leading icon and an optional trailing slot. */
 .input-group {
   position: relative;
   display: flex;
@@ -330,173 +433,269 @@ textarea.input {
 }
 .input-group > .icon:first-child {
   position: absolute;
-  left: 10px;
+  left: 14px;
   color: var(--text-faint);
   pointer-events: none;
+  transition: color var(--d-1) var(--ease-out);
 }
 .input-group > .input {
-  padding-left: 34px;
+  padding-left: 42px;
+}
+.input-group:focus-within > .icon:first-child {
+  color: var(--accent-text);
 }
 .input-group > .input-trailing {
   position: absolute;
-  right: 4px;
+  right: 6px;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
+}
+.input-group > .input-sm {
+  padding-left: 36px;
+}
+.input-group:has(> .input-sm) > .icon:first-child {
+  left: 12px;
+}
+/* Search pill (44px): <div class="input-group input-search"> */
+.input-search > .input {
+  height: var(--input-h);
+  border-radius: var(--r-pill);
+  padding-left: 44px;
+}
+.input-search > .icon:first-child {
+  left: 16px;
 }
 
 .field {
   display: grid;
-  gap: 6px;
+  gap: var(--sp-2);
 }
 .field-label {
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-medium);
+  margin-left: var(--sp-1);
+  font-size: 13px;
+  font-weight: var(--fw-strong);
   color: var(--text);
 }
 .field-hint {
-  font-size: var(--fs-xs);
-  color: var(--text-faint);
+  margin-inline: var(--sp-1);
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
 }
 .field-error {
-  font-size: var(--fs-xs);
+  margin-inline: var(--sp-1);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
   color: var(--danger);
 }
 
-/* Toggle switch: <label class="switch"><input type="checkbox"><span class="switch-track"></span> Label</label> */
+/* Toggle switch: <label class="switch"><input type="checkbox"><span class="switch-track"></span> Label</label>
+   (or <span class="switch"> around an input[role=switch] + track). Round knob with a spring. */
 .switch {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: var(--sp-3);
   cursor: pointer;
   user-select: none;
+  -webkit-user-select: none;
 }
 .switch input {
   position: absolute;
   opacity: 0;
   width: 1px;
   height: 1px;
+  margin: 0;
 }
 .switch-track {
   position: relative;
-  width: 36px;
-  height: 20px;
+  width: 42px;
+  height: 24px;
   flex: none;
-  border-radius: var(--radius-full);
-  background: var(--surface-3);
-  border: 1px solid var(--border-strong);
-  transition: background-color var(--dur) var(--ease);
+  border-radius: var(--r-pill);
+  background: var(--fill-3);
+  box-shadow: inset 0 0 0 1px var(--hairline-strong);
+  transition:
+    background-color var(--d-2) var(--ease-out),
+    box-shadow var(--d-2) var(--ease-out);
 }
 .switch-track::after {
   content: '';
   position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 14px;
-  height: 14px;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background: var(--text-muted);
+  background: #fff;
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.35),
+    0 0 0 0.5px rgba(0, 0, 0, 0.06);
   transition:
-    transform var(--dur) var(--ease),
-    background-color var(--dur) var(--ease);
+    transform var(--d-3) var(--ease-spring),
+    width var(--d-2) var(--ease-spring),
+    background-color var(--d-2) var(--ease-out);
+}
+/* Pressed: the knob stretches toward the side it will travel to. */
+.switch:active input:not(:disabled) + .switch-track::after {
+  width: 22px;
 }
 .switch input:checked + .switch-track {
-  background: var(--accent);
-  border-color: transparent;
+  background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 4px 14px -4px rgb(var(--accent-rgb) / 0.7);
 }
 .switch input:checked + .switch-track::after {
-  transform: translateX(16px);
-  background: var(--accent-contrast);
+  transform: translateX(18px);
+  background: var(--on-accent);
+}
+.switch:active input:checked:not(:disabled) + .switch-track::after {
+  transform: translateX(14px);
+}
+.switch:hover input:not(:checked):not(:disabled) + .switch-track {
+  background: color-mix(in srgb, var(--text-faint) 34%, transparent);
 }
 .switch input:focus-visible + .switch-track {
-  outline: 2px solid var(--accent-ring);
-  outline-offset: 2px;
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}
+.switch input:disabled + .switch-track {
+  opacity: 0.5;
+}
+.switch:has(input:disabled) {
+  cursor: not-allowed;
 }
 
-/* Segmented control: <div class="segmented" role="tablist"><button aria-selected="true">…</button>…</div> */
+/* Segmented control: <div class="segmented" role="tablist|radiogroup"><button aria-selected="true">…</button>…</div>
+   Add .segmented-block to stretch it to the full width. */
 .segmented {
   display: inline-flex;
-  padding: 3px;
+  padding: 4px;
   gap: 2px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  background: var(--fill-1);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  border-radius: var(--r-pill);
+}
+.segmented-block {
+  display: flex;
 }
 .segmented > button {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 30px;
-  padding: 0 var(--sp-3);
-  border-radius: calc(var(--radius) - 3px);
+  height: 32px;
+  padding: 0 14px;
+  border-radius: var(--r-pill);
   color: var(--text-muted);
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-medium);
+  font-size: 13px;
+  font-weight: var(--fw-strong);
+  white-space: nowrap;
   flex: 1;
   transition:
-    background-color var(--dur-fast) var(--ease),
-    color var(--dur-fast) var(--ease);
+    background-color var(--d-1) var(--ease-out),
+    color var(--d-1) var(--ease-out),
+    box-shadow var(--d-2) var(--ease-out);
+}
+/* A 32px segment with a 40px hit area: the well's 4px padding belongs to the nearest button. */
+.segmented > button::after {
+  content: '';
+  position: absolute;
+  inset: -4px 0;
 }
 .segmented > button:hover {
   color: var(--text);
 }
 .segmented > button[aria-selected='true'],
-.segmented > button[aria-pressed='true'] {
-  background: var(--surface-1);
+.segmented > button[aria-pressed='true'],
+.segmented > button[aria-checked='true'] {
+  background: var(--fill-3);
   color: var(--text);
-  box-shadow: var(--shadow-1);
+  box-shadow:
+    inset 0 0 0 1px var(--hairline-strong),
+    var(--glass-highlight),
+    var(--shadow-sm);
+}
+:root[data-mode='light'] .segmented > button[aria-selected='true'],
+:root[data-mode='light'] .segmented > button[aria-pressed='true'],
+:root[data-mode='light'] .segmented > button[aria-checked='true'] {
+  background: #fff;
+  box-shadow: var(--shadow-sm);
+}
+.segmented > button:focus-visible {
+  outline-offset: 1px;
 }
 
 /* --------------------------------------------------------------------------
-   Chips, badges, kbd
+   Chips, badges, counts, kbd
    -------------------------------------------------------------------------- */
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   height: 24px;
   padding: 0 10px;
-  border-radius: var(--radius-full);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--fill-2);
+  box-shadow: inset 0 0 0 1px var(--hairline);
   color: var(--text-muted);
   font-size: var(--fs-xs);
-  font-weight: var(--fw-medium);
+  font-weight: var(--fw-strong);
+  letter-spacing: 0.01em;
   white-space: nowrap;
+  transition:
+    background-color var(--d-1) var(--ease-out),
+    color var(--d-1) var(--ease-out);
 }
 button.chip:hover {
   color: var(--text);
-  border-color: var(--border-strong);
+  background: var(--fill-3);
 }
-.chip.is-active {
-  background: var(--accent-soft);
-  border-color: transparent;
+.chip.is-active,
+.chip-accent {
+  background: rgb(var(--accent-rgb) / 0.16);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.28);
+  color: var(--accent-text);
+}
+button.chip.is-active:hover {
+  background: rgb(var(--accent-rgb) / 0.24);
   color: var(--accent-text);
 }
 
+/* Small status pill (sentence case, like the row flags). */
 .badge {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   height: 20px;
-  padding: 0 7px;
-  border-radius: var(--radius-xs);
-  font-size: var(--fs-2xs);
+  padding: 0 8px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-micro);
   font-weight: var(--fw-bold);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  background: var(--surface-3);
+  line-height: 1;
+  background: var(--fill-2);
   color: var(--text-muted);
   white-space: nowrap;
 }
 .badge-accent {
-  background: var(--accent-soft);
+  background: rgb(var(--accent-rgb) / 0.16);
   color: var(--accent-text);
 }
+/* LIVE: the one uppercase badge; white on --live-bg is 4.7:1. */
 .badge-live {
-  background: var(--live);
+  height: 22px;
+  padding: 0 9px 0 8px;
+  gap: 6px;
+  background: var(--live-bg);
   color: #fff;
+  font-weight: var(--fw-black);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+    0 6px 18px -6px rgba(224, 36, 42, 0.9);
 }
 .badge-live::before {
   content: '';
@@ -504,6 +703,7 @@ button.chip:hover {
   height: 6px;
   border-radius: 50%;
   background: currentColor;
+  box-shadow: 0 0 0 2.5px rgba(255, 255, 255, 0.3);
   animation: live-pulse 1.6s var(--ease-in-out) infinite;
 }
 .badge-danger {
@@ -513,6 +713,14 @@ button.chip:hover {
 .badge-warning {
   background: var(--warning-soft);
   color: var(--warning);
+}
+.badge-success {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.badge-info {
+  background: var(--info-soft);
+  color: var(--info);
 }
 @keyframes live-pulse {
   0%,
@@ -526,6 +734,7 @@ button.chip:hover {
 
 .count {
   font-size: var(--fs-xs);
+  font-weight: var(--fw-strong);
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
@@ -536,13 +745,16 @@ button.chip:hover {
   min-width: 22px;
   height: 22px;
   padding: 0 6px;
-  border-radius: var(--radius-xs);
-  background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  border-bottom-width: 2px;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
+  border-radius: 7px;
+  background: var(--fill-1);
+  box-shadow:
+    inset 0 0 0 1px var(--hairline-strong),
+    0 1px 0 var(--hairline);
+  color: var(--text-faint);
+  font-family: var(--font);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-bold);
+  font-variant-numeric: tabular-nums;
   line-height: 1;
 }
 
@@ -573,24 +785,44 @@ button.chip:hover {
     transform: rotate(360deg);
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation-duration: 2s;
+
+/* Shimmer: a soft light band sweeping across a fill-2 bone. */
+.skeleton {
+  border-radius: var(--r-pill);
+  background-color: var(--fill-2);
+  background-image: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.07) 40%,
+    rgba(255, 255, 255, 0.07) 50%,
+    transparent 70%
+  );
+  background-size: 220% 100%;
+  background-repeat: no-repeat;
+  animation: shimmer 1.6s var(--ease-in-out) infinite;
+}
+:root[data-mode='light'] .skeleton {
+  background-image: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.65) 40%,
+    rgba(255, 255, 255, 0.65) 50%,
+    transparent 70%
+  );
+}
+@keyframes shimmer {
+  from {
+    background-position: 160% 0;
+  }
+  to {
+    background-position: -60% 0;
   }
 }
 
-.skeleton {
-  background: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2));
-  background-size: 200% 100%;
-  animation: shimmer 1.4s linear infinite;
-  border-radius: var(--radius-xs);
-}
-@keyframes shimmer {
-  to {
-    background-position: -200% 0;
-  }
-}
 @media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2s; /* a spinner that stops reads as frozen; slow it down instead */
+  }
   .skeleton,
   .badge-live::before {
     animation: none;
@@ -598,67 +830,125 @@ button.chip:hover {
 }
 
 /* --------------------------------------------------------------------------
-   Avatar (channel logo with initials fallback)
-   <span class="avatar"><img …></span>  or  <span class="avatar avatar-fallback" style="--hue: 210">AB</span>
+   Avatar (channel logo on a neutral plate, or hashed-hue initials)
+   <span class="avatar"><img …></span>  ·  <span class="avatar avatar-fallback">AB</span> + --hue (or --h)
+   Size with --size; the radius stays ≈32% of it (44 → 14).
    -------------------------------------------------------------------------- */
 .avatar {
-  --size: 40px;
+  --size: 44px;
   position: relative;
   display: grid;
   place-items: center;
   width: var(--size);
   height: var(--size);
   flex: none;
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
+  border-radius: calc(var(--size) * 0.32);
+  background: var(--tile-bg);
+  box-shadow: inset 0 0 0 1px var(--hairline);
   overflow: hidden;
   font-size: calc(var(--size) * 0.34);
-  font-weight: var(--fw-semibold);
+  font-weight: var(--fw-heavy);
+  letter-spacing: -0.01em;
   color: var(--text-muted);
   user-select: none;
+  -webkit-user-select: none;
 }
+/* Pinned to the plate (not a grid item): in the grid's auto-sized row, height: 100% fell back to the image's
+   intrinsic aspect, so portrait logos grew taller than the plate and lost their top and bottom. */
 .avatar img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: contain;
-  padding: 4px;
+  /* The logo's opaque box (logo-art.js), so transparent margins don't shrink it; ignored where unsupported. */
+  object-view-box: var(--logo-box, none);
+  padding: var(--logo-pad, calc(var(--size) * 0.12));
+}
+/* A loaded logo gets the light plate so dark and coloured wordmarks stay visible. */
+.avatar.is-loaded {
+  background: var(--logo-plate);
+  box-shadow: var(--logo-plate-ring);
+}
+/* Dark mode: the plate sits a step below white, so a column of logos doesn't out-shine the content.
+   (A tokens.css value in waiting: --logo-plate.) */
+:root:not([data-mode='light']) {
+  --logo-plate: #e4e7ee;
+}
+/* Fitted by logo-art.js once the logo has loaded:
+   - wide wordmarks get less padding, so they render about twice as large;
+   - app-icon logos (a solid near-square) run edge to edge, with no plate around them;
+   - opaque logos on an even colour take that colour as their plate, so the box disappears;
+   - white or pale logos (sampled, where the host allows CORS) sit on a dark plate in both modes. */
+.avatar[data-shape='wide'] {
+  --logo-pad: calc(var(--size) * 0.07);
+}
+.avatar[data-fill='bleed'] {
+  --logo-pad: 0px;
+  --logo-plate: transparent;
+}
+.avatar[data-fill='matte'] {
+  --logo-plate: var(--logo-matte);
+}
+.avatar[data-tone='light']:not([data-fill]) {
+  --logo-plate: #1c2030;
+  --logo-plate-ring: inset 0 0 0 1px rgba(255, 255, 255, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 .avatar-fallback {
-  --hue: 220;
-  background: hsl(var(--hue) 45% 50% / 0.16);
-  color: hsl(var(--hue) 70% 72%);
-  border-color: transparent;
+  --h: var(--hue, 220);
+  color: hsl(var(--h) 95% 84%);
+  background: linear-gradient(145deg, hsl(var(--h) 80% 60% / 0.38), hsl(calc(var(--h) + 40) 75% 45% / 0.18));
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--h) 90% 75% / 0.18),
+    inset 0 1px 0 hsl(var(--h) 90% 85% / 0.14);
 }
 :root[data-mode='light'] .avatar-fallback {
-  color: hsl(var(--hue) 55% 38%);
+  color: hsl(var(--h) 75% 30%);
+  background: linear-gradient(145deg, hsl(var(--h) 85% 62% / 0.3), hsl(calc(var(--h) + 40) 80% 55% / 0.14));
+  box-shadow: inset 0 0 0 1px hsl(var(--h) 60% 40% / 0.14);
 }
 
 /* --------------------------------------------------------------------------
-   Popover & menu (see ui/popover.js)
+   Popover & menu (see ui/popover.js): floating glass, radius 22, scale-in from the anchor side
    -------------------------------------------------------------------------- */
 .popover {
   position: fixed;
   z-index: var(--z-popover);
-  min-width: 200px;
+  min-width: 220px;
   max-width: min(360px, calc(100vw - 16px));
   max-height: min(70vh, 520px);
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 6px;
-  background: var(--surface-1);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-3);
+  color: var(--text);
+  background: var(--glass-sheen), var(--glass-bg-strong);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-radius: var(--r-card);
+  box-shadow:
+    var(--shadow-pop),
+    inset 0 0 0 1px var(--hairline-strong),
+    var(--glass-highlight);
   opacity: 0;
-  transform: translateY(-4px) scale(0.98);
+  transform: translateY(-4px) scale(0.96);
   transform-origin: top left;
   transition:
-    opacity var(--dur-fast) var(--ease),
-    transform var(--dur-fast) var(--ease);
+    opacity var(--d-2) var(--ease-out),
+    transform var(--d-3) var(--ease-out);
+}
+.popover[data-placement$='end'] {
+  transform-origin: top right;
 }
 .popover[data-placement^='top'] {
-  transform: translateY(4px) scale(0.98);
+  transform: translateY(4px) scale(0.96);
   transform-origin: bottom left;
+}
+.popover[data-placement^='top'][data-placement$='end'] {
+  transform-origin: bottom right;
+}
+.popover[data-placement^='right'] {
+  transform: translateX(-4px) scale(0.96);
+  transform-origin: left top;
 }
 .popover.is-open {
   opacity: 1;
@@ -668,35 +958,56 @@ button.chip:hover {
 .menu,
 .menu-group {
   display: grid;
-  gap: 1px;
+  gap: 2px;
 }
 .menu-item {
   display: flex;
   align-items: center;
   gap: 10px;
   width: 100%;
-  min-height: 34px;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
+  min-height: 40px;
+  padding: 6px 12px;
+  border-radius: 15px;
   color: var(--text);
   font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
   text-align: left;
+  transition: background-color var(--d-1) var(--ease-out);
 }
 .menu-item > .icon {
   color: var(--text-muted);
 }
 .menu-item:hover,
 .menu-item:focus-visible {
-  background: var(--surface-hover);
+  background: var(--fill-2);
   outline: none;
 }
 .menu-item:focus-visible {
-  box-shadow: inset 0 0 0 1px var(--accent-ring);
+  box-shadow: inset 0 0 0 2px var(--ring);
 }
 .menu-item:disabled {
   opacity: 0.45;
 }
 .menu-item.is-checked {
+  background: rgb(var(--accent-rgb) / 0.26);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.35);
+}
+.menu-item.is-checked:hover {
+  background: rgb(var(--accent-rgb) / 0.32);
+}
+.menu-item.is-checked:focus-visible {
+  box-shadow:
+    inset 0 0 0 1px rgb(var(--accent-rgb) / 0.35),
+    inset 0 0 0 2px var(--ring);
+}
+:root[data-mode='light'] .menu-item.is-checked {
+  background: rgb(var(--accent-rgb) / 0.14);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.3);
+}
+:root[data-mode='light'] .menu-item.is-checked:hover {
+  background: rgb(var(--accent-rgb) / 0.2);
+}
+.menu-item.is-checked > .icon:not(.menu-check) {
   color: var(--accent-text);
 }
 .menu-item.is-danger {
@@ -704,6 +1015,10 @@ button.chip:hover {
 }
 .menu-item.is-danger > .icon {
   color: currentColor;
+}
+.menu-item.is-danger:hover,
+.menu-item.is-danger:focus-visible {
+  background: var(--danger-soft);
 }
 .menu-item-label {
   flex: 1;
@@ -713,39 +1028,47 @@ button.chip:hover {
   white-space: nowrap;
 }
 .menu-item-hint {
-  color: var(--text-faint);
-  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
   font-variant-numeric: tabular-nums;
 }
 .menu-check {
+  width: 18px;
   color: var(--accent-text) !important;
 }
 .menu-icon-spacer {
   width: 16px;
   flex: none;
 }
+/* Radio items keep an 18px check column at the end, so labels and sub-labels line up. */
+.menu-item[role='menuitemradio'][aria-checked='false']::after {
+  content: '';
+  width: 18px;
+  flex: none;
+}
 .menu-separator {
   height: 1px;
-  margin: 5px 4px;
-  background: var(--border);
+  margin: 6px 10px;
+  background: var(--hairline-strong);
 }
 .menu-label {
-  padding: 8px 10px 4px;
-  font-size: var(--fs-2xs);
-  font-weight: var(--fw-semibold);
-  letter-spacing: 0.08em;
+  padding: 10px 12px 6px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-heavy);
+  letter-spacing: var(--ls-caps);
   text-transform: uppercase;
   color: var(--text-faint);
 }
 
 /* --------------------------------------------------------------------------
-   Toasts (see ui/toast.js)
+   Toasts (see ui/toast.js): floating glass pill-card bottom-right; status icon in a tinted disc
    -------------------------------------------------------------------------- */
 .toasts {
   position: fixed;
   z-index: var(--z-toast);
-  right: var(--sp-4);
-  bottom: var(--sp-4);
+  right: max(28px, env(safe-area-inset-right));
+  bottom: max(28px, env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -758,73 +1081,135 @@ button.chip:hover {
   align-items: center;
   gap: var(--sp-3);
   min-width: 260px;
-  max-width: 420px;
-  padding: 10px 8px 10px 14px;
-  background: var(--surface-1);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-2);
+  max-width: 460px; /* room for a title and a one-line sub-line ("Loaded 147 channels…" + a warning) */
+  padding: 10px 10px 10px 12px;
+  color: var(--text);
+  background: var(--glass-sheen), var(--glass-bg-strong);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-radius: var(--r-card);
+  box-shadow:
+    var(--shadow-pop),
+    inset 0 0 0 1px var(--hairline-strong),
+    var(--glass-highlight);
   pointer-events: auto;
   opacity: 0;
-  transform: translateY(8px);
+  transform: translateY(12px);
   transition:
-    opacity var(--dur) var(--ease),
-    transform var(--dur) var(--ease);
+    opacity var(--d-4) var(--ease-out),
+    transform var(--d-4) var(--ease-out);
 }
 .toast.is-visible {
   opacity: 1;
   transform: none;
 }
+/* toast.js removes the element 220ms after this class lands: keep the exit shorter than that. */
 .toast.is-leaving {
   opacity: 0;
-  transform: translateY(4px);
+  transform: translateY(6px) scale(0.98);
+  transition:
+    opacity var(--d-2) var(--ease-out),
+    transform var(--d-2) var(--ease-out);
 }
 .toast-icon {
+  width: 34px;
+  height: 34px;
+  padding: 8px;
+  border-radius: 50%;
   color: var(--info);
+  background: var(--info-soft);
 }
 .toast-success .toast-icon {
   color: var(--success);
+  background: var(--success-soft);
 }
 .toast-warning .toast-icon {
   color: var(--warning);
+  background: var(--warning-soft);
 }
 .toast-error .toast-icon {
   color: var(--danger);
+  background: var(--danger-soft);
 }
-.toast-message {
+.toast-text {
+  display: grid;
   flex: 1;
   min-width: 0;
-  font-size: var(--fs-sm);
+  gap: 1px;
+}
+.toast-message {
+  font-size: var(--fs-ui);
+  font-weight: var(--fw-semibold);
   line-height: 1.4;
   overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+.toast-text.has-detail .toast-message {
+  font-weight: var(--fw-bold);
+}
+.toast-detail {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  line-height: 1.4;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  text-wrap: pretty; /* no lone "(rtmp://)." on the last line */
 }
 .toast-action {
-  padding: 4px 10px;
-  border-radius: var(--radius-sm);
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-semibold);
-  color: var(--accent-text);
+  position: relative;
+  flex: none;
+  height: var(--btn-h-sm);
+  padding: 0 14px;
+  border-radius: var(--r-pill);
+  font-size: 13px;
+  font-weight: var(--fw-strong);
+  color: var(--text);
+  background: var(--fill-2);
+  box-shadow:
+    inset 0 0 0 1px var(--hairline-strong),
+    var(--glass-highlight);
+  transition:
+    background-color var(--d-1) var(--ease-out),
+    transform var(--d-2) var(--ease-spring);
 }
 .toast-action:hover {
-  background: var(--accent-soft);
+  background: var(--fill-3);
+}
+.toast-action:active {
+  transform: scale(0.97);
+}
+/* 34px pill and 32px dismiss, 40px hit areas (the toast's padding leaves room). */
+.toast-action::after,
+.toast-close::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+}
+.toast-close::after {
+  inset: -4px;
 }
 .toast-close {
+  position: relative;
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: var(--radius-sm);
-  color: var(--text-faint);
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  color: var(--text-muted);
+  transition:
+    background-color var(--d-1) var(--ease-out),
+    color var(--d-1) var(--ease-out);
 }
 .toast-close:hover {
-  background: var(--surface-hover);
+  background: var(--fill-2);
   color: var(--text);
 }
-@media (max-width: 640px) {
+@media (max-width: 720px) {
   .toasts {
-    left: var(--sp-3);
-    right: var(--sp-3);
-    bottom: var(--sp-3);
+    left: max(var(--sp-4), env(safe-area-inset-left));
+    right: max(var(--sp-4), env(safe-area-inset-right));
+    bottom: max(var(--sp-4), env(safe-area-inset-bottom));
     align-items: stretch;
   }
   .toast {
@@ -834,14 +1219,14 @@ button.chip:hover {
 }
 /* Phones show dialogs as bottom sheets (dialogs.css): toasts rendered inside one go to the top of the
    screen so they never cover the sheet's action buttons. Newest first, sliding in from above. */
-@media (max-width: 639.98px) {
+@media (max-width: 720px) {
   dialog .toasts {
     top: max(var(--sp-3), env(safe-area-inset-top));
     bottom: auto;
     flex-direction: column-reverse;
   }
   dialog .toast {
-    transform: translateY(-8px);
+    transform: translateY(-12px);
   }
 }
 
@@ -862,17 +1247,20 @@ button.chip:hover {
 .empty-state-icon {
   display: grid;
   place-items: center;
-  width: 52px;
-  height: 52px;
+  width: 56px;
+  height: 56px;
   margin-bottom: var(--sp-2);
-  border-radius: var(--radius-lg);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--text-faint);
+  border-radius: 18px;
+  color: var(--accent-text);
+  background: rgb(var(--accent-rgb) / 0.14);
+  box-shadow:
+    inset 0 0 0 1px rgb(var(--accent-rgb) / 0.24),
+    0 0 0 8px rgb(var(--accent-rgb) / 0.05);
 }
 .empty-state h3 {
   font-size: var(--fs-lg);
-  font-weight: var(--fw-semibold);
+  font-weight: var(--fw-heavy);
+  letter-spacing: -0.015em;
   color: var(--text);
 }
 .empty-state p {
@@ -889,7 +1277,52 @@ button.chip:hover {
 
 .divider {
   height: 1px;
-  background: var(--border);
+  background: var(--hairline);
   border: 0;
   margin: var(--sp-3) 0;
+}
+
+/* --------------------------------------------------------------------------
+   Touch: larger targets (buttons and icon buttons grow through --btn-h / --icon-btn in tokens.css)
+   -------------------------------------------------------------------------- */
+@media (pointer: coarse) {
+  .segmented > button {
+    height: 36px;
+  }
+  .menu-item {
+    min-height: 44px;
+  }
+  /* 36px on a phone's narrow toast, with 44px hit areas, so the message keeps its width. */
+  .toast-action {
+    height: 36px;
+  }
+  .toast-close {
+    width: 36px;
+    height: 36px;
+  }
+  .toast-action::after,
+  .toast-close::after {
+    inset: -4px;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Forced colors (Windows High Contrast): give the glass surfaces real edges
+   -------------------------------------------------------------------------- */
+@media (forced-colors: active) {
+  .glass,
+  .glass-float,
+  .popover,
+  .toast {
+    border: 1px solid CanvasText;
+  }
+  .glass::before {
+    display: none;
+  }
+  .switch-track {
+    border: 1px solid CanvasText;
+  }
+  .menu-item.is-checked {
+    outline: 1px solid Highlight;
+  }
 }

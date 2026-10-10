@@ -90,6 +90,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   proxyStreams: true, // play blocked streams (insecure http://, no CORS) through the relay
   hideUnplayable: false, // hide channels that can't play here (unsupported formats, DRM, recently failed)
   autoRefreshHours: 24, // re-download URL playlists in the background when older than this (0 = never)
+  ambientColor: true, // tint the background with the playing video's colours ("Ambient colour from video")
 });
 
 export const DEFAULT_SESSION = Object.freeze({
