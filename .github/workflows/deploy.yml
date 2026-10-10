@@ -41,6 +41,10 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          # Optional repository variable (Settings → Secrets and variables → Actions → Variables) to point
+          # the site at a different built-in stream relay, or "off" to disable it. Unset = the default.
+          VITE_BUILTIN_RELAY: ${{ vars.BUILTIN_RELAY }}
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
